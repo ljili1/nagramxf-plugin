@@ -1,0 +1,745 @@
+# -*- coding: utf-8 -*-
+"""
+WS Proxy (tcp2ws) — Nullgram 的 WebSocket 代理功能移植为 NagramXF 插件。
+
+原理（与 Nullgram 内置实现一致）：
+  1. 在本机 127.0.0.1 起一个 SOCKS5 服务；
+  2. tgnet 拨到哪个 Telegram DC 地址，就按路由表把该地址映射到对应的
+     Cloudflare 子域（pluto/venus/aurora/vesta/flora.<域名>）；
+  3. 与该子域的 /api 建立 WebSocket（wss，子协议 binary），
+     TCP 字节流 <-> WS 二进制帧 双向转发；
+  4. 插件自动向 Telegram 代理列表注册 127.0.0.1:<端口> 的 SOCKS5 代理并启用。
+
+路由表来源：qwq233/Nullgram libs/tcp2ws + docs/wsproxy/records.txt，
+并合入了以下修正：
+  - 补 149.154.167.41（dc2 -> venus）精确行；
+  - dc4/dc5 的 IPv6 /64 前缀键（Telegram 会下发同块的 ::b 等未登记主机）；
+  - 查表失败时按 SOCKS5 "Host unreachable" 拒绝（不回退裸 IP：
+    裸 IP 的 wss 因 SNI 问题不可用，拒绝更快且更可诊断）。
+
+依赖：仅 Python 标准库（socket / ssl / threading），不需要第三方包。
+"""
+
+__id__ = "ws_proxy"
+__name__ = "WS Proxy (tcp2ws)"
+__description__ = (
+    "将 Nullgram 的 tcp2ws WebSocket 代理移植为插件："
+    "本机 SOCKS5 -> 按 DC 路由到 Cloudflare 子域 -> wss://<子域>/api。"
+    "默认使用 Nullgram 公共域名，也可填自建域名。"
+)
+__author__ = "ljili (port of qwq233/Nullgram)"
+__version__ = "1.0.0"
+
+import base64
+import ipaddress
+import os
+import socket
+import ssl
+import struct
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# 可选的 Java / SDK 互操作（在 NagramXF 插件运行时内可用；本地 CPython 调试时为空）
+# ---------------------------------------------------------------------------
+try:
+    from java import jclass  # noqa: F401
+    from base_plugin import BasePlugin
+    from android_utils import log as _alog, run_on_ui_thread
+    from ui.settings import Header, Switch, Selector, Input, Text, Divider
+    _IN_HOST = True
+except Exception:  # 本地 CPython 调试
+    _IN_HOST = False
+
+    class BasePlugin(object):
+        id = "ws_proxy"
+
+        def log(self, msg):
+            print("[%s] %s" % (self.id, msg))
+
+        def get_setting(self, key, default=None):
+            return default
+
+        def set_setting(self, key, value, reload_settings=False):
+            pass
+
+    def run_on_ui_thread(fn, delay=0):
+        fn()
+
+    def _alog(msg):
+        print(msg)
+
+
+# ---------------------------------------------------------------------------
+# 默认配置（与 Nullgram 内置值一致）
+# ---------------------------------------------------------------------------
+DEFAULT_DOMAIN = "ck2ut7v3g5zudnjw.top"
+DEFAULT_CONN_HASH = "381d52f35f552e10ad1701445dba9cd14acb7e43"
+DEFAULT_PORT = 6356
+# 注意：Nullgram 公共中继的边缘规则要求 User-Agent 含 "Nullgram"，否则 302。
+PLUGIN_UA = "Nullgram 12.0.0 (1200) NagramXF-ws-proxy/1.0.0"
+
+# DC -> 子域映射（固定，勿猜）
+DC_SUBDOMAINS = {
+    1: "pluto", 2: "venus", 3: "aurora", 4: "vesta", 5: "flora",
+    17: "test_pluto", 18: "test_venus", 19: "test_aurora",
+}
+
+
+# ---------------------------------------------------------------------------
+# 路由表
+# ---------------------------------------------------------------------------
+def build_routes(domain):
+    """返回 (exact_table, v6_prefix_table)。
+
+    exact_table 的键包含两种：
+      - 精确主机（IPv4 点分串 / IPv6 压缩串）；
+      - 截尾前缀（如 "149.154.167.5"、"91.108.4."），
+        由「截尾 0-3 个字符」查表算法命中。
+    v6_prefix_table 只对单 DC 独占的 /64 放前缀键（dc4/dc5）。
+    """
+    t = {}
+
+    def put(key, dc):
+        t[key] = "%s.%s" % (DC_SUBDOMAINS[dc], domain)
+
+    def put6(addr, dc):
+        put(ipaddress.IPv6Address(addr).compressed, dc)
+
+    # media（权威地址，records.txt）
+    put("149.154.175.50", 1)
+    put("149.154.167.51", 2)
+    put("95.161.76.100", 2)
+    put("149.154.175.100", 3)
+    put("149.154.167.91", 4)
+    put("149.154.171.5", 5)
+    put6("2001:b28:f23d:f001::a", 1)
+    put6("2001:67c:4e8:f002::a", 2)
+    put6("2001:b28:f23d:f003::a", 3)
+    put6("2001:67c:4e8:f004::a", 4)
+    put6("2001:b28:f23f:f005::a", 5)
+
+    # proxy（上游 tcp2wsServer.setCdnDomain 的完整集合）
+    put("149.154.175.5", 1)        # 前缀：.175.50-.59 均为 dc1
+    put("149.154.161.144", 2)
+    put("149.154.167.15", 2)
+    put("149.154.167.5", 2)        # 前缀：.167.50-.59
+    put("149.154.167.6", 2)        # 前缀：.167.60-.69
+    put("149.154.167.7", 2)        # 前缀：.167.70-.79
+    put("149.154.167.2", 2)        # 前缀：.167.20-.29
+    put("149.154.167.41", 2)       # 修正：dc2，截尾算法进不到 .4，必须精确行
+    put("91.108.4.", 4)            # dc4 独占段
+    put("149.154.164.", 4)
+    put("149.154.165.", 4)
+    put("149.154.166.", 4)
+    put("149.154.167.8", 4)
+    put("149.154.167.9", 4)
+    put("91.108.56.", 5)
+    put("111.62.91.", 2)
+    put6("2001:b28:f23d:f001::d", 1)
+    put6("2001:67c:4e8:f002::d", 2)
+    put6("2001:b28:f23d:f003::d", 3)
+    put6("2001:67c:4e8:f004::d", 4)
+    put6("2001:b28:f23f:f005::d", 5)
+
+    # test DC（测试模式）
+    put("149.154.175.10", 17)
+    put("149.154.175.40", 17)
+    put("149.154.167.40", 18)
+    put("149.154.175.117", 19)
+    put6("2001:b28:f23d:f001::e", 17)
+    put6("2001:67c:4e8:f002::e", 18)
+    put6("2001:b28:f23d:f003::e", 19)
+
+    # IPv6 /64 前缀键：只放单 DC 独占的块（f001/f002/f003 与 test 共用，不能放）
+    p6 = {}
+    p6["2001:67c:4e8:f004"] = "%s.%s" % (DC_SUBDOMAINS[4], domain)   # dc4 独占
+    p6["2001:b28:f23f:f005"] = "%s.%s" % (DC_SUBDOMAINS[5], domain)   # dc5 独占
+
+    return t, p6
+
+
+def lookup_server(ip_str, table, v6_prefix):
+    """按上游「截尾 0-3 字符」语义查表；IPv6 追加 /64 回退；查不到返回 None（拒绝）。"""
+    s = ip_str
+    if ":" in s:
+        try:  # 归一化为压缩形式，与 Java getHostAddress() 对齐
+            s = ipaddress.IPv6Address(s).compressed
+        except Exception:
+            pass
+    for i in range(0, 4):
+        key = s if i == 0 else s[:-i]
+        hit = table.get(key)
+        if hit is not None:
+            return hit
+    if ":" in s:
+        try:
+            groups = ipaddress.IPv6Address(s).exploded.split(":")[:4]
+            p64 = ":".join(g.lstrip("0") or "0" for g in groups)
+            return v6_prefix.get(p64)
+        except Exception:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 纯 stdlib 的 WebSocket 客户端（仅实现所需子集：二进制帧、ping/pong、close）
+# ---------------------------------------------------------------------------
+class WsError(Exception):
+    pass
+
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise WsError("unexpected eof")
+        buf += chunk
+    return buf
+
+
+def ws_connect(host, use_tls, user_agent, conn_hash, timeout=5.0, insecure=False):
+    """与 wss://host/api 建立 WebSocket，返回已就绪的 socket。"""
+    port = 443 if use_tls else 80
+    raw = socket.create_connection((host, port), timeout=timeout)
+    if use_tls:
+        if insecure:
+            ctx = ssl._create_unverified_context()  # noqa: SLF001（设置项，默认关闭）
+        else:
+            ctx = ssl.create_default_context()
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+    else:
+        sock = raw
+    sock.settimeout(timeout)
+
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    req = (
+        "GET /api HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Protocol: binary\r\n"
+        "User-Agent: %s\r\n"
+        "Conn-Hash: %s\r\n"
+        "\r\n"
+    ) % (host, key, user_agent, conn_hash)
+    sock.sendall(req.encode("ascii"))
+
+    # 读响应头（上限 16 KB，防异常对端）
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise WsError("eof during handshake")
+        resp += chunk
+        if len(resp) > 16384:
+            raise WsError("handshake response too large")
+    head = resp.split(b"\r\n\r\n", 1)[0]
+    try:
+        status_line = head.split(b"\r\n", 1)[0].decode("latin-1")
+        status_code = int(status_line.split(" ", 2)[1])
+    except Exception:
+        raise WsError("bad handshake response: %r" % head[:80])
+    if status_code != 101:
+        raise WsError("handshake rejected: HTTP %d" % status_code)
+
+    sock.settimeout(None)  # 进入长连接模式，阻塞读
+    return sock
+
+
+class WsConn(object):
+    """封装一条已建立的 WebSocket：发送加锁（数据帧与 pong 会并发）。"""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.send_lock = threading.Lock()
+        self.closed = False
+
+    def _send_frame(self, opcode, payload):
+        # 客户端帧必须带 mask
+        header = bytearray()
+        header.append(0x80 | opcode)
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length <= 0xFFFF:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", length)
+        mask = os.urandom(4)
+        header += mask
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        with self.send_lock:
+            self.sock.sendall(bytes(header) + masked)
+
+    def send_binary(self, data):
+        self._send_frame(0x2, data)
+
+    def send_pong(self, payload):
+        self._send_frame(0xA, payload)
+
+    def send_close(self):
+        try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+
+    def recv_message(self):
+        """返回下一条完整二进制消息（bytes）；连接关闭返回 None。
+        自动处理分片、ping、pong、close。"""
+        fragments = []
+        while True:
+            hdr = _recv_exact(self.sock, 2)
+            fin = hdr[0] & 0x80
+            opcode = hdr[0] & 0x0F
+            masked = hdr[1] & 0x80
+            length = hdr[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", _recv_exact(self.sock, 2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", _recv_exact(self.sock, 8))[0]
+            mask = _recv_exact(self.sock, 4) if masked else None
+            payload = _recv_exact(self.sock, length) if length else b""
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+            if opcode == 0x8:  # close
+                return None
+            if opcode == 0x9:  # ping -> pong
+                self.send_pong(payload)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            if opcode in (0x0, 0x1, 0x2):  # continuation / text / binary
+                fragments.append(payload)
+                if fin:
+                    return b"".join(fragments)
+                continue
+            # 未知 opcode：按规范应失败，这里直接断开
+            return None
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                self.send_close()
+            except Exception:
+                pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# SOCKS5 服务端（只实现 CONNECT；无认证 / RFC1929 透传接受）
+# ---------------------------------------------------------------------------
+class Relay(object):
+    def __init__(self, logger):
+        self.table = {}
+        self.v6_prefix = {}
+        self.domain = DEFAULT_DOMAIN
+        self.use_tls = True
+        self.conn_hash = DEFAULT_CONN_HASH
+        self.user_agent = PLUGIN_UA
+        self.insecure_tls = False
+        self.port = DEFAULT_PORT
+
+        self._server_sock = None
+        self._accept_thread = None
+        self._stopping = threading.Event()
+        self._lock = threading.Lock()
+        self.tunnels_open = 0
+        self.tunnels_total = 0
+        self.last_error = ""
+        self.log = logger
+
+    # ---- 配置 ----
+    def configure(self, domain, use_tls, conn_hash, user_agent, insecure_tls, port):
+        with self._lock:
+            self.domain = (domain or DEFAULT_DOMAIN).strip()
+            self.use_tls = bool(use_tls)
+            self.conn_hash = conn_hash if conn_hash is not None else DEFAULT_CONN_HASH
+            self.user_agent = user_agent or PLUGIN_UA
+            self.insecure_tls = bool(insecure_tls)
+            self.port = int(port)
+            self.table, self.v6_prefix = build_routes(self.domain)
+
+    # ---- 生命周期 ----
+    @property
+    def running(self):
+        return self._server_sock is not None
+
+    def start(self):
+        with self._lock:
+            if self._server_sock is not None:
+                return True
+            if not self.table:
+                self.configure(self.domain, self.use_tls, self.conn_hash,
+                               self.user_agent, self.insecure_tls, self.port)
+            try:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", self.port))
+                srv.listen(64)
+                srv.settimeout(1.0)
+            except OSError as e:
+                self.last_error = "bind 127.0.0.1:%d failed: %s" % (self.port, e)
+                self.log(self.last_error)
+                return False
+            self._server_sock = srv
+            self._stopping.clear()
+            self._accept_thread = threading.Thread(
+                target=self._accept_loop, name="wsproxy-accept", daemon=True)
+            self._accept_thread.start()
+            self.log("tcp2ws listening on 127.0.0.1:%d -> *.%s (tls=%s)"
+                     % (self.port, self.domain, self.use_tls))
+            return True
+
+    def stop(self):
+        with self._lock:
+            self._stopping.set()
+            srv = self._server_sock
+            self._server_sock = None
+        if srv is not None:
+            try:
+                srv.close()
+            except Exception:
+                pass
+        self.log("tcp2ws stopped")
+
+    # ---- accept ----
+    def _accept_loop(self):
+        while not self._stopping.is_set():
+            try:
+                client, _addr = self._server_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle_client_safe,
+                             args=(client,), name="wsproxy-client",
+                             daemon=True).start()
+
+    def _handle_client_safe(self, client):
+        try:
+            self._handle_client(client)
+        except Exception as e:
+            self.last_error = "session error: %s" % e
+        finally:
+            with self._lock:
+                self.tunnels_open = max(0, self.tunnels_open - 1)
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    # ---- SOCKS5 ----
+    def _handle_client(self, client):
+        client.settimeout(15.0)
+        ver = _recv_exact(client, 1)[0]
+        if ver != 0x05:
+            raise WsError("not socks5 (ver=%d)" % ver)
+        nmethods = _recv_exact(client, 1)[0]
+        methods = _recv_exact(client, nmethods)
+        if 0x00 in methods:
+            client.sendall(b"\x05\x00")
+        elif 0x02 in methods:
+            client.sendall(b"\x05\x02")
+            self._socks5_auth(client)  # 透传接受任意凭据
+        else:
+            client.sendall(b"\x05\xff")
+            return
+
+        hdr = _recv_exact(client, 4)
+        _ver, cmd, _rsv, atyp = hdr[0], hdr[1], hdr[2], hdr[3]
+        if atyp == 0x01:
+            target = socket.inet_ntoa(_recv_exact(client, 4))
+        elif atyp == 0x04:
+            target = socket.inet_ntop(socket.AF_INET6, _recv_exact(client, 16))
+        elif atyp == 0x03:
+            dlen = _recv_exact(client, 1)[0]
+            target = _recv_exact(client, dlen).decode("idna", "replace")
+        else:
+            self._socks5_reply(client, 0x08)
+            return
+        _port = struct.unpack(">H", _recv_exact(client, 2))[0]
+
+        if cmd != 0x01:  # 只支持 CONNECT
+            self._socks5_reply(client, 0x07)
+            return
+
+        server = lookup_server(target, self.table, self.v6_prefix)
+        if server is None:
+            # 可诊断的拒绝优于静默误路由（见路由表设计原则）
+            self.log("no ws upstream for %s, refusing the tunnel" % target)
+            self._socks5_reply(client, 0x04)
+            return
+
+        with self._lock:
+            self.tunnels_open += 1
+            self.tunnels_total += 1
+
+        try:
+            ws_sock = ws_connect(server, self.use_tls, self.user_agent,
+                                 self.conn_hash, insecure=self.insecure_tls)
+        except Exception as e:
+            self.last_error = "ws dial %s failed: %s" % (server, e)
+            self.log(self.last_error)
+            self._socks5_reply(client, 0x05)
+            return
+
+        self._socks5_reply(client, 0x00)
+        client.settimeout(None)
+        self._bridge(client, WsConn(ws_sock), server)
+
+    @staticmethod
+    def _socks5_auth(client):
+        # RFC1929：接受任意用户名/密码
+        _ver = _recv_exact(client, 1)[0]
+        ulen = _recv_exact(client, 1)[0]
+        _recv_exact(client, ulen)
+        plen = _recv_exact(client, 1)[0]
+        _recv_exact(client, plen)
+        client.sendall(b"\x01\x00")
+
+    @staticmethod
+    def _socks5_reply(client, code):
+        client.sendall(b"\x05" + bytes([code]) + b"\x00\x01\x00\x00\x00\x00\x00\x00")
+
+    # ---- 双向转发 ----
+    def _bridge(self, client, ws, server):
+        started = time.time()
+        done = threading.Event()
+
+        def client_to_ws():
+            try:
+                while not done.is_set():
+                    data = client.recv(32768)
+                    if not data:
+                        break
+                    ws.send_binary(data)
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        t = threading.Thread(target=client_to_ws, name="wsproxy-c2w", daemon=True)
+        t.start()
+        try:
+            while not done.is_set():
+                msg = ws.recv_message()
+                if msg is None:
+                    break
+                if msg:
+                    client.sendall(msg)
+        except Exception:
+            pass
+        finally:
+            done.set()
+            ws.close()
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            age = time.time() - started
+            if age < 5.0:  # 短死连接记录一下，便于排障
+                self.log("tunnel to %s closed after %.1fs" % (server, age))
+
+
+# ---------------------------------------------------------------------------
+# Telegram 代理注册（org.telegram.messenger.SharedConfig）
+# ---------------------------------------------------------------------------
+class TelegramProxyBridge(object):
+    """把本机 SOCKS5 端口注册为 Telegram 的当前代理；禁用时移除。"""
+
+    def __init__(self, logger):
+        self.log = logger
+        self._proxy_info = None
+
+    @staticmethod
+    def _classes():
+        SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+        ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+        NotificationCenter = jclass("org.telegram.messenger.NotificationCenter")
+        return SharedConfig, ProxyInfo, NotificationCenter
+
+    def enable(self, port):
+        try:
+            SharedConfig, ProxyInfo, NotificationCenter = self._classes()
+            info = ProxyInfo("127.0.0.1", int(port), "", "", "")
+            added = SharedConfig.addProxy(info)
+            if added is None:
+                added = info
+            SharedConfig.setCurrentProxy(added)
+            SharedConfig.setProxyEnable(True)
+            self._proxy_info = added
+
+            def notify():
+                try:
+                    NotificationCenter.getGlobalInstance().postNotificationName(
+                        NotificationCenter.proxySettingsChanged)
+                except Exception:
+                    pass
+            run_on_ui_thread(notify)
+            self.log("registered socks5 proxy 127.0.0.1:%d" % port)
+            return True
+        except Exception as e:
+            self.log("register proxy failed: %s" % e)
+            return False
+
+    def disable(self):
+        try:
+            SharedConfig, _ProxyInfo, NotificationCenter = self._classes()
+            try:
+                SharedConfig.setProxyEnable(False)
+            except Exception:
+                pass
+            if self._proxy_info is not None:
+                try:
+                    SharedConfig.deleteProxy(self._proxy_info)
+                except Exception:
+                    pass
+                self._proxy_info = None
+
+            def notify():
+                try:
+                    NotificationCenter.getGlobalInstance().postNotificationName(
+                        NotificationCenter.proxySettingsChanged)
+                except Exception:
+                    pass
+            run_on_ui_thread(notify)
+        except Exception as e:
+            self.log("unregister proxy failed: %s" % e)
+
+
+# ---------------------------------------------------------------------------
+# 插件入口
+# ---------------------------------------------------------------------------
+PROVIDERS = ["Nullgram 默认", "自定义"]
+
+
+class WsProxyPlugin(BasePlugin):
+
+    # ---- 生命周期 ----
+    def on_plugin_load(self):
+        self._relay = Relay(self.log)
+        self._bridge = TelegramProxyBridge(self.log) if _IN_HOST else None
+        self._apply_config()
+        if self.get_setting("enabled", False):
+            self._start()
+
+    def on_plugin_unload(self):
+        self._stop()
+
+    def on_app_event(self, event_type):
+        if str(event_type) == "app_start" and self.get_setting("enabled", False):
+            if not getattr(self, "_relay", None) or not self._relay.running:
+                try:
+                    self._apply_config()
+                    self._start()
+                except Exception as e:
+                    self.log("restart on app_start failed: %s" % e)
+
+    # ---- 配置 ----
+    def _effective_domain(self):
+        if int(self.get_setting("provider", 0)) == 0:
+            return DEFAULT_DOMAIN
+        return (self.get_setting("domain", "") or "").strip() or DEFAULT_DOMAIN
+
+    def _apply_config(self):
+        port_raw = self.get_setting("listen_port", str(DEFAULT_PORT))
+        try:
+            port = int(str(port_raw).strip())
+            if not (1 <= port <= 65535):
+                port = DEFAULT_PORT
+        except Exception:
+            port = DEFAULT_PORT
+        self._relay.configure(
+            domain=self._effective_domain(),
+            use_tls=bool(self.get_setting("tls", True)),
+            conn_hash=self.get_setting("conn_hash", DEFAULT_CONN_HASH),
+            user_agent=self.get_setting("user_agent", PLUGIN_UA) or PLUGIN_UA,
+            insecure_tls=bool(self.get_setting("insecure_tls", False)),
+            port=port,
+        )
+
+    def _start(self):
+        if not self._relay.running:
+            if not self._relay.start():
+                return
+        if self._bridge is not None:
+            self._bridge.enable(self._relay.port)
+
+    def _stop(self):
+        try:
+            if self._bridge is not None:
+                self._bridge.disable()
+        except Exception:
+            pass
+        try:
+            self._relay.stop()
+        except Exception:
+            pass
+
+    def _restart(self):
+        was_enabled = bool(self.get_setting("enabled", False))
+        self._stop()
+        self._apply_config()
+        if was_enabled:
+            self._start()
+
+    # ---- 设置界面 ----
+    def create_settings(self):
+        def on_toggle_enabled(*_a):
+            if self.get_setting("enabled", False):
+                self._apply_config()
+                self._start()
+            else:
+                self._stop()
+
+        def on_restart(*_a):
+            self._restart()
+
+        def status_subtext():
+            r = getattr(self, "_relay", None)
+            if r is None or not r.running:
+                return "未运行"
+            return "127.0.0.1:%d | 隧道 活动%d/累计%d | *.%s" % (
+                r.port, r.tunnels_open, r.tunnels_total, r.domain)
+
+        return [
+            Header(text="WS Proxy (tcp2ws)"),
+            Switch(key="enabled", text="启用 WS 代理", default=False,
+                   subtext="启动本机 SOCKS5 中继并设为 Telegram 当前代理",
+                   on_change=lambda *a: on_toggle_enabled()),
+            Selector(key="provider", text="服务商", default=0,
+                     items=PROVIDERS,
+                     on_change=lambda *a: on_restart()),
+            Input(key="domain", text="自定义域名", default="",
+                  subtext="仅「自定义」服务商生效，如 example.com",
+                  on_change=lambda *a: on_restart()),
+            Input(key="conn_hash", text="Conn-Hash", default=DEFAULT_CONN_HASH,
+                  subtext="中继握手附加头，自建服务端按部署文档填写",
+                  on_change=lambda *a: on_restart()),
+            Input(key="user_agent", text="User-Agent", default=PLUGIN_UA,
+                  subtext="Nullgram 公共中继要求 UA 含 Nullgram 字样",
+                  on_change=lambda *a: on_restart()),
+            Switch(key="tls", text="使用 TLS (wss)", default=True,
+                   subtext="Cloudflare 部署必须开启",
+                   on_change=lambda *a: on_restart()),
+            Input(key="listen_port", text="监听端口", default=str(DEFAULT_PORT),
+                  subtext="本机 SOCKS5 端口，默认 6356",
+                  on_change=lambda *a: on_restart()),
+            Switch(key="insecure_tls", text="跳过 TLS 证书校验", default=False,
+                   subtext="仅排障使用，存在安全风险",
+                   on_change=lambda *a: on_restart()),
+            Divider(),
+            Text(text="运行状态", subtext=status_subtext(),
+                 on_click=lambda *a: self.log(status_subtext())),
+        ]
