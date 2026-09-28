@@ -43,7 +43,7 @@ __description__ = (
     "消息长按菜单可查看单条消息的命中规则。"
 )
 __author__ = "ljili"
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 import threading
 import time
@@ -583,7 +583,7 @@ class FilterSentinelPlugin(BasePlugin):
         self._install_hooks()
         self._install_menus()
         status = self._status_line()
-        self.log("过滤器哨兵 v2.3 已加载：%s" % status)
+        self.log("过滤器哨兵 v2.4 已加载：%s" % status)
         self._show_load_bulletin(status)
 
     def on_plugin_unload(self):
@@ -823,49 +823,14 @@ class FilterSentinelPlugin(BasePlugin):
 
     # ------------------------------------------------------------------
     # 原位占位条：替换 DummyView
+    # 注意：占位条不挂任何触摸监听、保持不可点击。交互事件经宿主
+    # RecyclerListView 手势检测 → onItemClick/onItemLongClick →
+    # ChatActivity.createMenu，由 _before_create_menu 分派。
     # ------------------------------------------------------------------
-    def _attach_bar_listeners(self, view, meta):
-        """给占位条挂点击/长按监听。meta 以闭包捕获，不依赖视图身份查找。
-
-        meta = (adapter, account, dialog_id, msg_ids)。优先用 SDK 包装类，
-        缺失时退回 dynamic_proxy 自定义实现。"""
-        plugin = self
-
-        def _do_click(v):
-            plugin._on_bar_click(meta)
-
-        def _do_long(v):
-            plugin._on_bar_long_click(meta)
-            return True
-
-        if OnClickListener is not None and OnLongClickListener is not None:
-            view.setOnClickListener(OnClickListener(_do_click))
-            view.setOnLongClickListener(OnLongClickListener(_do_long))
-            return
-
-        class _Click(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
-            def onClick(self, v):
-                _do_click(v)
-
-        class _LongClick(dynamic_proxy(jclass("android.view.View$OnLongClickListener"))):
-            def onLongClick(self, v):
-                _do_long(v)
-                return True
-
-        view.setOnClickListener(_Click())
-        view.setOnLongClickListener(_LongClick())
-
     def _clear_bar(self, view):
-        """GONE/回收状态下清除监听与 meta，避免旧闭包在复用视图上误触发。"""
+        """GONE/回收状态下清除 meta，避免旧数据在复用视图上误触发。"""
         try:
             self._bar_meta.pop(int(view.hashCode()), None)
-        except Exception:
-            pass
-        try:
-            view.setOnClickListener(None)
-            view.setOnLongClickListener(None)
-            view.setClickable(False)
-            view.setLongClickable(False)
         except Exception:
             pass
 
@@ -928,6 +893,15 @@ class FilterSentinelPlugin(BasePlugin):
             view.setGravity(17)  # Gravity.CENTER
             view.setPadding(0, 24, 0, 24)
             view.setTag(self.PLACEHOLDER_TAG)
+            # 关键：占位条必须保持不可点击（与宿主 DummyView 一致）。
+            # RecyclerListView.onInterceptTouchEvent 会把 DOWN 事件先喂给子 View，
+            # 若子 View 消费（clickable），interceptedByChild=true，
+            # 手势检测器收不到事件，onItemClick/createMenu 永不触发，
+            # 而子 View 自己的 OnClickListener 在这条分发路径下也不会被调起。
+            # 交互全部由 ChatActivity.createMenu 的 hook 承接。
+            view.setClickable(False)
+            view.setLongClickable(False)
+            view.setFocusable(False)
             view.setLayoutParams(RecyclerView.LayoutParams(
                 RecyclerView.LayoutParams.MATCH_PARENT,
                 RecyclerView.LayoutParams.WRAP_CONTENT))
@@ -1009,12 +983,11 @@ class FilterSentinelPlugin(BasePlugin):
 
             view.setVisibility(0)  # VISIBLE
             view.setText(format_placeholder_text(len(run)))
-            meta = (adapter, account, dialog_id, list(msg_ids))
             try:
-                self._bar_meta[int(view.hashCode())] = meta
+                self._bar_meta[int(view.hashCode())] = (
+                    adapter, account, dialog_id, list(msg_ids))
             except Exception:
                 pass
-            self._attach_bar_listeners(view, meta)
         except Exception as e:
             self.log("占位条绑定异常: %s" % e)
 
