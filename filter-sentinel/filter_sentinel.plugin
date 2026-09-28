@@ -1,35 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-过滤器哨兵 (Filter Sentinel) v2 — NagramXF 内置正则过滤器的增强插件。
+过滤器哨兵 (Filter Sentinel) v2.1 — NagramXF 内置正则过滤器的增强插件。
 
 解决「消息被过滤后无声消失，不知道是否存在想看的消息」的问题。
-v2 起核心能力为「原位占位条」：在被过滤消息的原位置显示单行提示。
+核心能力为「原位占位条」：在被过滤消息的原位置显示单行提示。
 
-  1. 原位占位：hook ChatActivityAdapter.onCreateViewHolder，将宿主为被过滤
-     消息创建的 1px DummyView 替换为本插件的单行占位条
-     「已隐藏 N 条消息 · 点击展开 · 长按看规则」。
-  2. 连续合并：onBindViewHolder 时向前/向后探测连续被过滤消息，同一段
-     只保留段首一条占位条（其余 GONE），N 为整段条数。
+  1. 原位占位：hook ChatActivityAdapter.onCreateViewHolder，viewType 为
+     -1000（被过滤消息）时把宿主创建的 1px DummyView 整体替换为本插件的
+     单行占位条「已隐藏 N 条消息 · 点击展开 · 长按看规则」。
+  2. 连续合并：onBindViewHolder 时探测连续被过滤消息，同一段只保留段首
+     一条占位条（其余 GONE），N 为整段条数。占位条位于整段下方（进入
+     聊天时最先看到的位置）。
   3. 单击展开：点击段首占位条 → 该段消息全部以原生内容类型渲染
-     （通过 hook AyuFilter.shouldHideFilteredMessage 对已展开 id
-     短路返回 false 实现，不依赖 skipAyuFiltering —— 该字段每次
-     getItemViewType 都会被宿主覆写）。展开后弹出带「收回」按钮的
-     Bulletin，点击即恢复隐藏；聊天菜单亦有「重新隐藏已展开的消息」。
+     （hook AyuFilter.shouldHideFilteredMessage，对已展开 id 短路返回
+     false；不依赖 skipAyuFiltering —— 该字段每次 getItemViewType 都会
+     被宿主覆写）。展开后弹出带「收回」按钮的 Bulletin；聊天菜单亦有
+     「重新隐藏已展开的消息」。
   4. 长按看规则：长按占位条弹出该聊天命中规则清单（可复制）。
   5. 消息长按菜单「查看命中的过滤规则」：对单条消息重算并展示命中了
      哪些规则（本聊天规则 / 通用规则分列）。
-  6. 聊天菜单「本聊天 排除/恢复 过滤」：调用 AyuFilter.setDialogExcluded
-     官方通道的兜底入口。
+  6. 自诊断：加载时弹出组件状态 Bulletin；设置页「诊断信息」展示
+     各 hook 触发计数（可复制），用于真机排障。
 
-实现要点：
-  - 上游 NagramXF 的过滤隐藏路径：ChatActivityAdapter.getItemViewType
-    对被过滤消息返回 -1000 → onCreateViewHolder 创建 DummyView（1px）。
-    本插件不新增 view type，直接在 onCreateViewHolder 的 after 回调里
-    用 param.setResult 替换 Holder，规避匿名内部类点击链路的脆弱性。
-  - 命中规则由插件侧按 AyuFilter.isFilterMatch 的同款逻辑重算
-    （宿主 isFiltered 只返回布尔值，不记录命中项）。
-  - 匹配核心与占位条段探测为纯 Python（鸭类型），可在 CPython 下
-    离线单测（见 test_filter_sentinel.py）。
+v2.1 修复（针对「过滤后没有任何提示」的真机报告）：
+  - setTextColor 等颜色参数改为 Java 有符号 int（无符号 0xFFxxxxxx 超出
+    int 范围，Chaquopy 会按 long 匹配不到重载而抛异常 —— 旧版占位条
+    创建极可能在此静默失败）；
+  - import 分块防御：任一 SDK 模块缺失不再导致整个插件落入空桩；
+  - 占位条替换依据 viewType == -1000（权威），不再依赖类名字符串；
+  - 加载即显示状态 Bulletin，组件失败一目了然；
+  - 各 hook 增加触发计数，设置页可查看诊断信息。
 
 依赖：仅插件 SDK（base_plugin / hook_utils / client_utils / ui.*），
 不需要第三方 Python 包。
@@ -43,23 +43,17 @@ __description__ = (
     "消息长按菜单可查看单条消息的命中规则。"
 )
 __author__ = "ljili"
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import threading
 import time
 
 # ---------------------------------------------------------------------------
-# 可选的宿主互操作（NagramXF 插件运行时内可用；本地 CPython 调试时为空）
+# 分块 import：核心块失败才落入本地调试桩；外围模块各自降级。
 # ---------------------------------------------------------------------------
 try:
     from java import jclass, dynamic_proxy  # noqa: F401
     from base_plugin import BasePlugin, MenuItemData, MenuItemType
-    from android_utils import log as _alog, run_on_ui_thread, copy_to_clipboard
-    from hook_utils import find_class, get_private_field
-    from client_utils import get_last_fragment, get_current_account
-    from ui.settings import Header, Switch, Text, Divider
-    from ui.alert import AlertDialogBuilder
-    from ui.bulletin import BulletinHelper
     _IN_HOST = True
 except Exception:  # 本地 CPython 调试
     _IN_HOST = False
@@ -76,31 +70,70 @@ except Exception:  # 本地 CPython 调试
         def set_setting(self, key, value, reload_settings=False):
             pass
 
-    def run_on_ui_thread(fn, delay=0):
-        fn()
+    MenuItemData = None
+    MenuItemType = None
 
+try:
+    from android_utils import log as _alog
+except Exception:
     def _alog(msg):
         print(msg)
 
+try:
+    from android_utils import run_on_ui_thread
+except Exception:
+    try:
+        from client_utils import run_on_ui_thread
+    except Exception:
+        def run_on_ui_thread(fn, delay=0):
+            fn()
+
+try:
+    from android_utils import copy_to_clipboard
+except Exception:
     def copy_to_clipboard(text):
         print("clipboard: %s" % text)
 
+try:
+    from android_utils import OnClickListener, OnLongClickListener
+except Exception:
+    OnClickListener = None
+    OnLongClickListener = None
+
+try:
+    from hook_utils import find_class, get_private_field
+except Exception:
     def find_class(name):
         return None
 
     def get_private_field(obj, name):
         return None
 
+try:
+    from client_utils import get_last_fragment
+except Exception:
     def get_last_fragment():
         return None
 
+try:
+    from client_utils import get_current_account
+except Exception:
     def get_current_account():
         return 0
 
-    MenuItemData = None
-    MenuItemType = None
+try:
+    from ui.settings import Header, Switch, Text, Divider
+except Exception:
     Header = Switch = Text = Divider = None
+
+try:
+    from ui.alert import AlertDialogBuilder
+except Exception:
     AlertDialogBuilder = None
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:
     BulletinHelper = None
 
 
@@ -194,13 +227,13 @@ def compute_placeholder_state(is_filtered_fn, size, idx):
     """占位条段探测（纯函数，可单测）。
 
     is_filtered_fn(i) -> bool：消息列表中第 i 条是否被过滤。
-    size: 列表长度；idx: 当前占位条对应的消息下标（0 = 最新 = 列表底部）。
+    size: 列表长度；idx: 当前占位条对应的消息下标（0 = 最新 = 屏幕底部）。
 
     返回 (state, run_indexes)：
       - ("gone", [])       本条不应显示占位（未过滤/非正则隐藏）
-      - ("collapsed", [])  本条属于某段但非段首 → 折叠（段首在更大下标处，
-                           即屏幕上更靠上的位置）
-      - ("head", [i..j])   本条是段首 → 显示占位条，run 为整段下标
+      - ("collapsed", [])  本条属于某段但非段首 → 折叠
+      - ("head", [i..j])   本条是段首（段内最小下标，位于整段下方）→
+                           显示占位条，run 为整段下标（向更旧方向延伸）
     """
     if idx < 0 or idx >= size:
         return ("gone", [])
@@ -208,14 +241,17 @@ def compute_placeholder_state(is_filtered_fn, size, idx):
         return ("gone", [])
     if idx - 1 >= 0 and is_filtered_fn(idx - 1):
         return ("collapsed", [])
-    # 段首 = 段内最小下标（屏幕上位于整段下方，进入聊天时最先被看到）；
-    # 整段向更旧方向（下标递增）延伸
     run = []
     j = idx
     while j < size and is_filtered_fn(j):
         run.append(j)
         j += 1
     return ("head", run)
+
+
+def jcolor(argb):
+    """0xAARRGGBB 转 Java 有符号 int（Chaquopy 超范围会按 long 匹配重载失败）。"""
+    return argb - 0x100000000 if argb >= 0x80000000 else argb
 
 
 class FilteredStore(object):
@@ -505,6 +541,7 @@ class FilterSentinelPlugin(BasePlugin):
     MENU_COLLAPSE_ID = "filter_sentinel_collapse"
     PLACEHOLDER_TAG = "filter_sentinel_placeholder"
     DUMMY_CLASS = "com.radolyn.ayugram.ui.DummyView"
+    HIDDEN_VIEW_TYPE = -1000
 
     def __init__(self):
         super().__init__()
@@ -515,7 +552,21 @@ class FilterSentinelPlugin(BasePlugin):
         self._revealed = {}          # (account, dialog_id) -> set(msg_id)
         self._revealed_lock = threading.Lock()
         self._view_meta = {}         # id(view) -> (adapter, account, dialog_id, msg_ids)
-        self._bulletin_fallback_chats = set()
+        self._fallback_notified = set()
+        # 诊断计数（全部只增，用于真机排障）
+        self.diag = {
+            "ayu_hooks": 0,          # AyuFilter 方法 hook 数
+            "adapter_hooks": 0,      # 适配器方法 hook 数
+            "should_hide_calls": 0,  # shouldHideFilteredMessage 回调次数
+            "filtered_records": 0,   # 记录到的被过滤消息条数
+            "create_calls": 0,       # onCreateViewHolder 回调次数
+            "m1000_creations": 0,    # viewType==-1000 的创建次数
+            "replacements": 0,       # 成功替换为占位条的次数
+            "replace_errors": 0,     # 替换异常次数
+            "bind_calls": 0,         # onBindViewHolder 回调次数
+            "placeholder_binds": 0,  # 占位条绑定次数
+            "menu_registered": 0,
+        }
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -523,8 +574,9 @@ class FilterSentinelPlugin(BasePlugin):
     def on_plugin_load(self):
         self._install_hooks()
         self._install_menus()
-        self.log("过滤器哨兵 v2 已加载（占位条 %s）。"
-                 % ("可用" if self._placeholder_ok else "不可用，降级 Bulletin"))
+        status = self._status_line()
+        self.log("过滤器哨兵 v2.1 已加载：%s" % status)
+        self._show_load_bulletin(status)
 
     def on_plugin_unload(self):
         for unhook in self._unhooks:
@@ -538,18 +590,41 @@ class FilterSentinelPlugin(BasePlugin):
             self._revealed.clear()
         self._view_meta.clear()
 
+    def _status_line(self):
+        return "AyuFilter hook %d · 适配器 hook %d · 菜单 %d · 占位条%s" % (
+            self.diag["ayu_hooks"], self.diag["adapter_hooks"],
+            self.diag["menu_registered"],
+            "可用" if self._placeholder_ok else "不可用")
+
+    def _show_load_bulletin(self, status):
+        if BulletinHelper is None:
+            return
+        try:
+            if self._placeholder_ok and self.diag["ayu_hooks"] > 0:
+                BulletinHelper.show_success(
+                    "过滤器哨兵已加载（%s）。若聊天已打开请重新进入。" % status,
+                    fragment=get_last_fragment())
+            else:
+                BulletinHelper.show_error(
+                    "过滤器哨兵组件缺失：%s。请到插件设置查看诊断信息。" % status,
+                    fragment=get_last_fragment())
+        except Exception as e:
+            self.log("加载提示失败: %s" % e)
+
     # ------------------------------------------------------------------
     # Hook 安装
     # ------------------------------------------------------------------
     def _install_hooks(self):
         ayu_cls = find_class("tw.nekomimi.nekogram.filters.AyuFilter")
         if ayu_cls is not None:
-            self._unhooks += self.hook_all_methods(
+            h1 = self.hook_all_methods(
                 ayu_cls, "shouldHideFilteredMessage",
                 before=self._before_should_hide,
                 after=self._after_should_hide)
-            self._unhooks += self.hook_all_methods(
+            h2 = self.hook_all_methods(
                 ayu_cls, "isFiltered", after=self._after_is_filtered)
+            self._unhooks += h1 + h2
+            self.diag["ayu_hooks"] = len(h1) + len(h2)
         else:
             self.log("未找到 AyuFilter 类，过滤记录不可用。")
 
@@ -560,12 +635,15 @@ class FilterSentinelPlugin(BasePlugin):
             bound = self.hook_all_methods(
                 adapter_cls, "onBindViewHolder", after=self._after_bind_holder)
             self._unhooks += created + bound
+            self.diag["adapter_hooks"] = len(created) + len(bound)
             self._placeholder_ok = bool(created) and bool(bound)
+        else:
+            self.log("未找到 ChatActivityAdapter 类。")
         if not self._placeholder_ok:
             self.log("ChatActivityAdapter hook 失败，原位占位条不可用。")
 
     def _install_menus(self):
-        if MenuItemData is None:
+        if MenuItemData is None or MenuItemType is None:
             return
         try:
             self.add_menu_item(MenuItemData(
@@ -576,6 +654,7 @@ class FilterSentinelPlugin(BasePlugin):
                 condition=self._message_menu_condition,
                 priority=90,
             ))
+            self.diag["menu_registered"] += 1
             self.add_menu_item(MenuItemData(
                 MenuItemType.CHAT_ACTION_MENU,
                 "重新隐藏已展开的消息",
@@ -583,6 +662,7 @@ class FilterSentinelPlugin(BasePlugin):
                 item_id=self.MENU_COLLAPSE_ID,
                 priority=91,
             ))
+            self.diag["menu_registered"] += 1
             self.add_menu_item(MenuItemData(
                 MenuItemType.CHAT_ACTION_MENU,
                 "本聊天 排除/恢复 过滤",
@@ -590,6 +670,7 @@ class FilterSentinelPlugin(BasePlugin):
                 item_id=self.MENU_CHAT_TOGGLE_ID,
                 priority=92,
             ))
+            self.diag["menu_registered"] += 1
         except Exception as e:
             self.log("菜单注册失败: %s" % e)
 
@@ -614,6 +695,7 @@ class FilterSentinelPlugin(BasePlugin):
 
     def _after_should_hide(self, param):
         try:
+            self.diag["should_hide_calls"] += 1
             args = _param_args(param)
             if not args or args[0] is None:
                 return
@@ -651,18 +733,19 @@ class FilterSentinelPlugin(BasePlugin):
                       + [rule_display_text(f) for f in matched.get("shared", [])])
         preview = self.bridge.get_message_text(msg)
         self.store.record(account, dialog_id, msg_id, rule_texts, preview)
+        self.diag["filtered_records"] += 1
         if not self._placeholder_ok:
             self._bulletin_fallback_once(account, dialog_id)
 
     def _bulletin_fallback_once(self, account, dialog_id):
         key = (account, dialog_id)
-        if key in self._bulletin_fallback_chats:
+        if key in self._fallback_notified:
             return
-        self._bulletin_fallback_chats.add(key)
+        self._fallback_notified.add(key)
         count = self.store.count(account, dialog_id)
         try:
             BulletinHelper.show_with_button(
-                "本聊天已过滤 %d 条消息" % count,
+                "本聊天已过滤 %d 条消息（占位条不可用，已降级）" % count,
                 0,
                 "查看",
                 lambda: self._show_rules_dialog(account, dialog_id),
@@ -674,27 +757,74 @@ class FilterSentinelPlugin(BasePlugin):
     # ------------------------------------------------------------------
     # 原位占位条：替换 DummyView
     # ------------------------------------------------------------------
-    def _after_create_holder(self, param):
-        """onCreateViewHolder 返回 DummyView 时，整体替换为本插件的占位 TextView。"""
-        if not self.get_setting("placeholder_enabled", True):
+    def _make_listeners(self, view):
+        """优先用 SDK 包装类，缺失时退回 dynamic_proxy 自定义实现。"""
+        plugin = self
+        if OnClickListener is not None and OnLongClickListener is not None:
+            view.setOnClickListener(OnClickListener(
+                lambda v: plugin._on_placeholder_click(v)))
+            view.setOnLongClickListener(OnLongClickListener(
+                lambda v: plugin._on_placeholder_long_click(v) or True))
             return
+
+        class _Click(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+            def onClick(self, v):
+                plugin._on_placeholder_click(v)
+
+        class _LongClick(dynamic_proxy(jclass("android.view.View$OnLongClickListener"))):
+            def onLongClick(self, v):
+                plugin._on_placeholder_long_click(v)
+                return True
+
+        view.setOnClickListener(_Click())
+        view.setOnLongClickListener(_LongClick())
+
+    def _after_create_holder(self, param):
+        """viewType == -1000（被过滤消息）时，把 DummyView 整体替换为占位条。"""
         try:
+            self.diag["create_calls"] += 1
+            args = _param_args(param)
+            if len(args) < 2:
+                return
+            try:
+                view_type = int(args[1])
+            except Exception:
+                return
+            if view_type != self.HIDDEN_VIEW_TYPE:
+                return
+            self.diag["m1000_creations"] += 1
+
+            if not self.get_setting("placeholder_enabled", True):
+                return
+
             holder = _param_result(param)
             if holder is None:
+                self.log("-1000 创建但 getResult 为空")
+                self.diag["replace_errors"] += 1
                 return
             item_view = holder.itemView
             if item_view is None:
+                self.log("-1000 创建但 itemView 为空")
+                self.diag["replace_errors"] += 1
                 return
-            if self.DUMMY_CLASS not in str(item_view.getClass().getName()):
-                return
+            cls_name = str(item_view.getClass().getName())
+            if self.DUMMY_CLASS not in cls_name:
+                # 类名不符也继续替换（viewType 才是权威），仅记录
+                self.log("-1000 的视图类为 %s（非预期 DummyView，仍替换）" % cls_name)
 
-            args = _param_args(param)
-            context = args[0] if args else None  # ViewGroup parent
+            context = None
             try:
-                context = context.getContext()
+                context = args[0].getContext()
             except Exception:
-                context = None
+                pass
             if context is None:
+                try:
+                    context = item_view.getContext()
+                except Exception:
+                    pass
+            if context is None:
+                self.log("-1000 替换失败：无法取得 Context")
+                self.diag["replace_errors"] += 1
                 return
 
             TextView = jclass("android.widget.TextView")
@@ -702,8 +832,8 @@ class FilterSentinelPlugin(BasePlugin):
             Holder = jclass("org.telegram.ui.Components.RecyclerListView$Holder")
 
             view = TextView(context)
-            view.setTextColor(0xFF8A8A8A)
-            view.setBackgroundColor(0x14000000)
+            view.setTextColor(jcolor(0xFF8A8A8A))
+            view.setBackgroundColor(jcolor(0x14000000))
             view.setTextSize(13.0)
             view.setGravity(17)  # Gravity.CENTER
             view.setPadding(0, 24, 0, 24)
@@ -711,24 +841,16 @@ class FilterSentinelPlugin(BasePlugin):
             view.setLayoutParams(RecyclerView.LayoutParams(
                 RecyclerView.LayoutParams.MATCH_PARENT,
                 RecyclerView.LayoutParams.WRAP_CONTENT))
+            self._make_listeners(view)
 
-            plugin = self
-
-            class _Click(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
-                def onClick(self, v):
-                    plugin._on_placeholder_click(v)
-
-            class _LongClick(dynamic_proxy(jclass("android.view.View$OnLongClickListener"))):
-                def onLongClick(self, v):
-                    plugin._on_placeholder_long_click(v)
-                    return True
-
-            view.setOnClickListener(_Click())
-            view.setOnLongClickListener(_LongClick())
-
-            _param_set_result(param, Holder(view))
+            if not _param_set_result(param, Holder(view)):
+                self.log("-1000 替换失败：setResult 不可用")
+                self.diag["replace_errors"] += 1
+                return
+            self.diag["replacements"] += 1
         except Exception as e:
-            self.log("占位条创建失败: %s" % e)
+            self.diag["replace_errors"] += 1
+            self.log("占位条创建异常: %s" % e)
 
     def _adapter_messages(self, adapter):
         """取当前生效的消息列表（公开字段，直接属性访问；失败走反射兜底）。"""
@@ -750,6 +872,7 @@ class FilterSentinelPlugin(BasePlugin):
     def _after_bind_holder(self, param):
         """对本插件占位条做段探测：段首显示「已隐藏 N 条」，段内其余 GONE。"""
         try:
+            self.diag["bind_calls"] += 1
             args = _param_args(param)
             if len(args) < 2:
                 return
@@ -757,6 +880,7 @@ class FilterSentinelPlugin(BasePlugin):
             view = holder.itemView
             if view is None or view.getTag() != self.PLACEHOLDER_TAG:
                 return
+            self.diag["placeholder_binds"] += 1
 
             adapter = _param_this(param)
             position = int(args[1])
@@ -797,7 +921,7 @@ class FilterSentinelPlugin(BasePlugin):
             view.setText(format_placeholder_text(len(run)))
             self._view_meta[id(view)] = (adapter, account, dialog_id, msg_ids)
         except Exception as e:
-            self.log("占位条绑定失败: %s" % e)
+            self.log("占位条绑定异常: %s" % e)
 
     # ------------------------------------------------------------------
     # 展开 / 收回
@@ -983,19 +1107,19 @@ class FilterSentinelPlugin(BasePlugin):
             return []
 
         def status_subtext():
-            return "已展开 %d 个聊天的消息；占位条 %s" % (
-                len(self._revealed),
-                "可用" if self._placeholder_ok else "不可用（已降级 Bulletin）")
+            return self._status_line()
 
         return [
             Header(text="过滤器哨兵"),
             Switch(key="placeholder_enabled", text="原位占位条", default=True,
                    subtext="在被过滤消息的原位置显示「已隐藏 N 条」单行提示；"
-                           "连续过滤自动合并为一条；关闭后占位条不再替换 1px 隐藏"),
+                           "连续过滤自动合并为一条；对已打开的聊天需重新进入生效"),
             Switch(key="menu_only_filtered", text="菜单仅对被过滤消息显示", default=True,
                    subtext="长按消息的「查看命中的过滤规则」仅在消息命中规则时出现"),
             Divider(),
             Text(text="运行状态", subtext=status_subtext()),
+            Text(text="诊断信息", subtext="查看各 hook 触发计数（排障用，可复制）",
+                 on_click=lambda *a: self._show_diag_dialog()),
             Text(text="重新隐藏全部已展开的消息",
                  subtext="收回本插件展开的所有被过滤消息",
                  on_click=lambda *a: self._collapse_everything()),
@@ -1003,6 +1127,34 @@ class FilterSentinelPlugin(BasePlugin):
                  subtext="清除本插件累计的被过滤消息统计（不影响过滤器本身）",
                  on_click=lambda *a: self._clear_all()),
         ]
+
+    def _show_diag_dialog(self):
+        d = self.diag
+        lines = [
+            "host 环境: %s" % ("是" if _IN_HOST else "否（异常！插件未接入宿主）"),
+            "AyuFilter hook 数: %d" % d["ayu_hooks"],
+            "适配器 hook 数: %d" % d["adapter_hooks"],
+            "占位条可用: %s" % ("是" if self._placeholder_ok else "否"),
+            "菜单注册数: %d" % d["menu_registered"],
+            "",
+            "shouldHide 回调: %d" % d["should_hide_calls"],
+            "过滤记录条数: %d" % d["filtered_records"],
+            "onCreateViewHolder 回调: %d" % d["create_calls"],
+            "-1000 创建次数: %d" % d["m1000_creations"],
+            "占位条替换成功: %d" % d["replacements"],
+            "替换异常: %d" % d["replace_errors"],
+            "onBindViewHolder 回调: %d" % d["bind_calls"],
+            "占位条绑定: %d" % d["placeholder_binds"],
+            "",
+            "判读指引：",
+            "· ayu_hooks=0 → AyuFilter 类名变了或 hook 失败",
+            "· should_hide_calls>0 且 filtered_records=0 → 重算逻辑异常",
+            "· filtered_records>0 且 m1000_creations=0 → 未走到 DummyView 创建"
+            "（聊天早已打开/隐藏机制不同），重新进入聊天再试",
+            "· m1000_creations>0 且 replacements=0 → 替换失败，看 replace_errors",
+            "· replacements>0 且 placeholder_binds=0 → bind 未识别占位条",
+        ]
+        self._show_dialog("过滤器哨兵诊断", "\n".join(lines), copyable=True)
 
     def _collapse_everything(self):
         with self._revealed_lock:
