@@ -1,0 +1,1017 @@
+# -*- coding: utf-8 -*-
+"""
+过滤器哨兵 (Filter Sentinel) v2 — NagramXF 内置正则过滤器的增强插件。
+
+解决「消息被过滤后无声消失，不知道是否存在想看的消息」的问题。
+v2 起核心能力为「原位占位条」：在被过滤消息的原位置显示单行提示。
+
+  1. 原位占位：hook ChatActivityAdapter.onCreateViewHolder，将宿主为被过滤
+     消息创建的 1px DummyView 替换为本插件的单行占位条
+     「已隐藏 N 条消息 · 点击展开 · 长按看规则」。
+  2. 连续合并：onBindViewHolder 时向前/向后探测连续被过滤消息，同一段
+     只保留段首一条占位条（其余 GONE），N 为整段条数。
+  3. 单击展开：点击段首占位条 → 该段消息全部以原生内容类型渲染
+     （通过 hook AyuFilter.shouldHideFilteredMessage 对已展开 id
+     短路返回 false 实现，不依赖 skipAyuFiltering —— 该字段每次
+     getItemViewType 都会被宿主覆写）。展开后弹出带「收回」按钮的
+     Bulletin，点击即恢复隐藏；聊天菜单亦有「重新隐藏已展开的消息」。
+  4. 长按看规则：长按占位条弹出该聊天命中规则清单（可复制）。
+  5. 消息长按菜单「查看命中的过滤规则」：对单条消息重算并展示命中了
+     哪些规则（本聊天规则 / 通用规则分列）。
+  6. 聊天菜单「本聊天 排除/恢复 过滤」：调用 AyuFilter.setDialogExcluded
+     官方通道的兜底入口。
+
+实现要点：
+  - 上游 NagramXF 的过滤隐藏路径：ChatActivityAdapter.getItemViewType
+    对被过滤消息返回 -1000 → onCreateViewHolder 创建 DummyView（1px）。
+    本插件不新增 view type，直接在 onCreateViewHolder 的 after 回调里
+    用 param.setResult 替换 Holder，规避匿名内部类点击链路的脆弱性。
+  - 命中规则由插件侧按 AyuFilter.isFilterMatch 的同款逻辑重算
+    （宿主 isFiltered 只返回布尔值，不记录命中项）。
+  - 匹配核心与占位条段探测为纯 Python（鸭类型），可在 CPython 下
+    离线单测（见 test_filter_sentinel.py）。
+
+依赖：仅插件 SDK（base_plugin / hook_utils / client_utils / ui.*），
+不需要第三方 Python 包。
+"""
+
+__id__ = "filter_sentinel"
+__name__ = "过滤器哨兵 (Filter Sentinel)"
+__description__ = (
+    "被过滤的消息在原位置显示单行占位条；连续过滤合并为一条；"
+    "点击展开原文、Bulletin 或菜单收回；长按查看命中的过滤规则；"
+    "消息长按菜单可查看单条消息的命中规则。"
+)
+__author__ = "ljili"
+__version__ = "2.0.0"
+
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# 可选的宿主互操作（NagramXF 插件运行时内可用；本地 CPython 调试时为空）
+# ---------------------------------------------------------------------------
+try:
+    from java import jclass, dynamic_proxy  # noqa: F401
+    from base_plugin import BasePlugin, MenuItemData, MenuItemType
+    from android_utils import log as _alog, run_on_ui_thread, copy_to_clipboard
+    from hook_utils import find_class, get_private_field
+    from client_utils import get_last_fragment, get_current_account
+    from ui.settings import Header, Switch, Text, Divider
+    from ui.alert import AlertDialogBuilder
+    from ui.bulletin import BulletinHelper
+    _IN_HOST = True
+except Exception:  # 本地 CPython 调试
+    _IN_HOST = False
+
+    class BasePlugin(object):
+        id = "filter_sentinel"
+
+        def log(self, msg):
+            print("[%s] %s" % (self.id, msg))
+
+        def get_setting(self, key, default=None):
+            return default
+
+        def set_setting(self, key, value, reload_settings=False):
+            pass
+
+    def run_on_ui_thread(fn, delay=0):
+        fn()
+
+    def _alog(msg):
+        print(msg)
+
+    def copy_to_clipboard(text):
+        print("clipboard: %s" % text)
+
+    def find_class(name):
+        return None
+
+    def get_private_field(obj, name):
+        return None
+
+    def get_last_fragment():
+        return None
+
+    def get_current_account():
+        return 0
+
+    MenuItemData = None
+    MenuItemType = None
+    Header = Switch = Text = Divider = None
+    AlertDialogBuilder = None
+    BulletinHelper = None
+
+
+# ===========================================================================
+# 纯 Python 匹配核心（与 AyuFilter.isFilterMatch / isFilteredInternal 对齐，
+# 全部使用鸭类型，便于离线测试）
+# ===========================================================================
+
+def is_filter_match(filter_obj, text, mask_enabled):
+    """单条规则是否命中（与 AyuFilter.isFilterMatch 逻辑一致）。"""
+    if filter_obj is None or not getattr(filter_obj, "enabled", False):
+        return False
+    pattern = getattr(filter_obj, "pattern", None)
+    if pattern is None or not text:
+        return False
+    if getattr(filter_obj, "reversed", False) and mask_enabled:
+        return False
+    try:
+        matched = bool(pattern.matcher(text).find())
+    except Exception:
+        return False
+    return (not matched) if getattr(filter_obj, "reversed", False) else matched
+
+
+def collect_matched(chat_filters, shared_filters, excluded_shared_ids,
+                    text, mask_enabled, is_private_dialog, enable_in_chats):
+    """按 AyuFilter.isFilteredInternal 的判定顺序收集命中规则。"""
+    result = {"chat": [], "shared": [], "suppressed_shared": False}
+    for f in chat_filters or []:
+        if is_filter_match(f, text, mask_enabled):
+            result["chat"].append(f)
+
+    if is_private_dialog and not enable_in_chats:
+        result["suppressed_shared"] = True
+        return result
+
+    excluded = excluded_shared_ids or set()
+    for f in shared_filters or []:
+        fid = getattr(f, "id", None)
+        if fid and fid in excluded:
+            continue
+        if is_filter_match(f, text, mask_enabled):
+            result["shared"].append(f)
+    return result
+
+
+def rule_display_text(filter_obj):
+    """规则的展示文本：反向规则加 '!= ' 前缀（对齐 AyuFilter.getFilterDisplayText）。"""
+    regex = getattr(filter_obj, "regex", None) or ""
+    return ("!= " + regex) if getattr(filter_obj, "reversed", False) else regex
+
+
+def format_rules_report(matched, dialog_id=None):
+    """把 collect_matched 的结果格式化为用户可读的清单。"""
+    chat_rules = [rule_display_text(f) for f in matched.get("chat", [])]
+    shared_rules = [rule_display_text(f) for f in matched.get("shared", [])]
+    total = len(chat_rules) + len(shared_rules)
+
+    lines = []
+    if total == 0:
+        lines.append("未命中任何规则。")
+        if matched.get("suppressed_shared"):
+            lines.append("（私聊中通用规则未启用，仅检查了本聊天规则。）")
+        lines.append("可能原因：消息是合集(相册)且按合集文本判定、")
+        lines.append("或规则在消息到达后被修改/删除。")
+        return "\n".join(lines)
+
+    head = "共命中 %d 条规则" % total
+    if dialog_id is not None:
+        head += "（聊天 %s）" % dialog_id
+    lines.append(head)
+    if chat_rules:
+        lines.append("")
+        lines.append("【本聊天规则】")
+        for i, r in enumerate(chat_rules, 1):
+            lines.append("%d. %s" % (i, r))
+    if shared_rules:
+        lines.append("")
+        lines.append("【通用规则】")
+        for i, r in enumerate(shared_rules, 1):
+            lines.append("%d. %s" % (i, r))
+    return "\n".join(lines)
+
+
+def format_placeholder_text(count):
+    """占位条文案。"""
+    return "已隐藏 %d 条消息 · 点击展开 · 长按看规则" % count
+
+
+def compute_placeholder_state(is_filtered_fn, size, idx):
+    """占位条段探测（纯函数，可单测）。
+
+    is_filtered_fn(i) -> bool：消息列表中第 i 条是否被过滤。
+    size: 列表长度；idx: 当前占位条对应的消息下标（0 = 最新 = 列表底部）。
+
+    返回 (state, run_indexes)：
+      - ("gone", [])       本条不应显示占位（未过滤/非正则隐藏）
+      - ("collapsed", [])  本条属于某段但非段首 → 折叠（段首在更大下标处，
+                           即屏幕上更靠上的位置）
+      - ("head", [i..j])   本条是段首 → 显示占位条，run 为整段下标
+    """
+    if idx < 0 or idx >= size:
+        return ("gone", [])
+    if not is_filtered_fn(idx):
+        return ("gone", [])
+    if idx - 1 >= 0 and is_filtered_fn(idx - 1):
+        return ("collapsed", [])
+    # 段首 = 段内最小下标（屏幕上位于整段下方，进入聊天时最先被看到）；
+    # 整段向更旧方向（下标递增）延伸
+    run = []
+    j = idx
+    while j < size and is_filtered_fn(j):
+        run.append(j)
+        j += 1
+    return ("head", run)
+
+
+class FilteredStore(object):
+    """按 (account, dialogId) 记录被过滤消息：条数 + 命中规则并集 + 样例。"""
+
+    def __init__(self, max_previews=3, max_rules=50):
+        self._lock = threading.Lock()
+        self._data = {}  # (account, dialog_id) -> dict
+        self._max_previews = max_previews
+        self._max_rules = max_rules
+
+    def _entry(self, key):
+        entry = self._data.get(key)
+        if entry is None:
+            entry = {
+                "msg_ids": set(),
+                "rules": [],
+                "rule_keys": set(),
+                "previews": [],
+                "updated": 0.0,
+            }
+            self._data[key] = entry
+        return entry
+
+    def record(self, account, dialog_id, msg_id, rule_texts, preview=None):
+        key = (int(account), int(dialog_id))
+        with self._lock:
+            entry = self._entry(key)
+            if msg_id is not None:
+                msg_id = int(msg_id)
+                if msg_id in entry["msg_ids"]:
+                    return len(entry["msg_ids"])
+                entry["msg_ids"].add(msg_id)
+            for rt in rule_texts or []:
+                if rt not in entry["rule_keys"] and len(entry["rules"]) < self._max_rules:
+                    entry["rule_keys"].add(rt)
+                    entry["rules"].append(rt)
+            if preview:
+                preview = preview.strip().replace("\n", " ")[:60]
+                if preview and preview not in entry["previews"] \
+                        and len(entry["previews"]) < self._max_previews:
+                    entry["previews"].append(preview)
+            entry["updated"] = time.time()
+            return len(entry["msg_ids"])
+
+    def count(self, account, dialog_id):
+        with self._lock:
+            entry = self._data.get((int(account), int(dialog_id)))
+            return len(entry["msg_ids"]) if entry else 0
+
+    def snapshot(self, account, dialog_id):
+        with self._lock:
+            entry = self._data.get((int(account), int(dialog_id)))
+            if not entry:
+                return None
+            return {
+                "count": len(entry["msg_ids"]),
+                "rules": list(entry["rules"]),
+                "previews": list(entry["previews"]),
+                "updated": entry["updated"],
+            }
+
+    def clear(self, account, dialog_id):
+        with self._lock:
+            self._data.pop((int(account), int(dialog_id)), None)
+
+    def clear_all(self):
+        with self._lock:
+            self._data.clear()
+
+
+# ===========================================================================
+# 宿主桥接层（全部防御式：任何反射失败返回 None/False，绝不向上抛）
+# ===========================================================================
+
+class AyuBridge(object):
+    """对 tw.nekomimi.nekogram.filters.AyuFilter / NaConfig 的薄封装。"""
+
+    def __init__(self, logger):
+        self._log = logger
+        self._ayu = None
+        self._naconfig = None
+        self._nc = None
+
+    @property
+    def ayu(self):
+        if self._ayu is None and _IN_HOST:
+            try:
+                self._ayu = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
+            except Exception as e:
+                self._log("AyuFilter 类加载失败: %s" % e)
+        return self._ayu
+
+    @property
+    def naconfig(self):
+        if self._naconfig is None and _IN_HOST:
+            try:
+                self._naconfig = jclass("xyz.nextalone.nagram.NaConfig")
+            except Exception as e:
+                self._log("NaConfig 类加载失败: %s" % e)
+        return self._naconfig
+
+    @property
+    def notification_center(self):
+        if self._nc is None and _IN_HOST:
+            try:
+                self._nc = jclass("org.telegram.messenger.NotificationCenter")
+            except Exception:
+                pass
+        return self._nc
+
+    # ---- 配置项 ----
+    def _cfg_bool(self, getter_name):
+        try:
+            inst = self.naconfig.INSTANCE
+            return bool(getattr(inst, getter_name)().Bool())
+        except Exception:
+            return False
+
+    def filters_enabled(self):
+        return self._cfg_bool("getRegexFiltersEnabled")
+
+    def mask_enabled(self):
+        return self._cfg_bool("getRegexFiltersMaskMessages")
+
+    def enable_in_chats(self):
+        return self._cfg_bool("getRegexFiltersEnableInChats")
+
+    # ---- 数据 ----
+    def is_dialog_excluded(self, dialog_id):
+        # 注意：Chaquopy 是 Python 3，无 long()；int 会自动转为 Java long。
+        try:
+            return bool(self.ayu.isDialogExcluded(int(dialog_id)))
+        except Exception:
+            return False
+
+    def get_message_text(self, msg):
+        try:
+            text = self.ayu.getMessageText(msg, None)
+            return None if text is None else str(text)
+        except Exception:
+            return None
+
+    def chat_filters(self, dialog_id):
+        try:
+            return list(self.ayu.getChatFiltersForDialog(int(dialog_id)))
+        except Exception:
+            return []
+
+    def shared_filters(self):
+        try:
+            return list(self.ayu.getRegexFilters())
+        except Exception:
+            return []
+
+    def excluded_shared_ids(self, dialog_id):
+        try:
+            return set(self.ayu.getExcludedSharedFilterIds(int(dialog_id)))
+        except Exception:
+            return set()
+
+    def set_dialog_excluded(self, dialog_id, excluded):
+        try:
+            self.ayu.setDialogExcluded(int(dialog_id), bool(excluded))
+            return True
+        except Exception as e:
+            self._log("setDialogExcluded 失败: %s" % e)
+            return False
+
+    def should_hide(self, msg):
+        """直接调用宿主判定（bind 时段探测用）。"""
+        try:
+            return bool(self.ayu.shouldHideFilteredMessage(msg, None))
+        except Exception:
+            return False
+
+    def post_filters_updated(self, account):
+        try:
+            nc_cls = self.notification_center
+            nc = nc_cls.getInstance(int(account))
+            nc.postNotificationName(nc_cls.regexFiltersUpdated)
+            return True
+        except Exception:
+            return False
+
+    # ---- 命中重算 ----
+    def matched_rules_for(self, msg, dialog_id):
+        if not self.filters_enabled():
+            return None
+        text = self.get_message_text(msg)
+        if not text:
+            return None
+        return collect_matched(
+            chat_filters=self.chat_filters(dialog_id),
+            shared_filters=self.shared_filters(),
+            excluded_shared_ids=self.excluded_shared_ids(dialog_id),
+            text=text,
+            mask_enabled=self.mask_enabled(),
+            is_private_dialog=dialog_id > 0,
+            enable_in_chats=self.enable_in_chats(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Xposed 回调参数的安全访问（param 为 Java MethodHookParam，鸭类型兼容）
+# ---------------------------------------------------------------------------
+
+def _param_args(param):
+    try:
+        return list(param.args)
+    except Exception:
+        return []
+
+
+def _param_result(param):
+    try:
+        return param.getResult()
+    except Exception:
+        pass
+    try:
+        return param.result
+    except Exception:
+        return None
+
+
+def _param_set_result(param, value):
+    """标准 Xposed 语义：before 里 setResult 会跳过原方法；after 里则覆盖返回值。"""
+    try:
+        param.setResult(value)
+        return True
+    except Exception:
+        pass
+    try:
+        param.result = value
+        return True
+    except Exception:
+        return False
+
+
+def _param_this(param):
+    for name in ("thisObject", "this_object"):
+        try:
+            return getattr(param, name)
+        except Exception:
+            pass
+    return None
+
+
+def _ctx_get(context, key, default=None):
+    if context is None:
+        return default
+    try:
+        value = context.get(key)
+        return default if value is None else value
+    except Exception:
+        try:
+            value = context[key]
+            return default if value is None else value
+        except Exception:
+            return default
+
+
+def _msg_account_dialog(msg):
+    """从 MessageObject 取 (account, dialog_id, msg_id)；失败返回 None。"""
+    try:
+        return (int(msg.currentAccount), int(msg.getDialogId()), int(msg.getId()))
+    except Exception:
+        return None
+
+
+def _msg_hidden_by_owner(msg):
+    """messageOwner.hide（AyuGram 另一类隐藏，与正则过滤无关）。"""
+    try:
+        owner = msg.messageOwner
+        return bool(owner is not None and owner.hide)
+    except Exception:
+        return False
+
+
+# ===========================================================================
+# 插件主体
+# ===========================================================================
+
+class FilterSentinelPlugin(BasePlugin):
+    MENU_RULES_ID = "filter_sentinel_rules"
+    MENU_CHAT_TOGGLE_ID = "filter_sentinel_chat_toggle"
+    MENU_COLLAPSE_ID = "filter_sentinel_collapse"
+    PLACEHOLDER_TAG = "filter_sentinel_placeholder"
+    DUMMY_CLASS = "com.radolyn.ayugram.ui.DummyView"
+
+    def __init__(self):
+        super().__init__()
+        self.store = FilteredStore()
+        self.bridge = AyuBridge(self.log)
+        self._unhooks = []
+        self._placeholder_ok = False
+        self._revealed = {}          # (account, dialog_id) -> set(msg_id)
+        self._revealed_lock = threading.Lock()
+        self._view_meta = {}         # id(view) -> (adapter, account, dialog_id, msg_ids)
+        self._bulletin_fallback_chats = set()
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+    def on_plugin_load(self):
+        self._install_hooks()
+        self._install_menus()
+        self.log("过滤器哨兵 v2 已加载（占位条 %s）。"
+                 % ("可用" if self._placeholder_ok else "不可用，降级 Bulletin"))
+
+    def on_plugin_unload(self):
+        for unhook in self._unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks = []
+        self.store.clear_all()
+        with self._revealed_lock:
+            self._revealed.clear()
+        self._view_meta.clear()
+
+    # ------------------------------------------------------------------
+    # Hook 安装
+    # ------------------------------------------------------------------
+    def _install_hooks(self):
+        ayu_cls = find_class("tw.nekomimi.nekogram.filters.AyuFilter")
+        if ayu_cls is not None:
+            self._unhooks += self.hook_all_methods(
+                ayu_cls, "shouldHideFilteredMessage",
+                before=self._before_should_hide,
+                after=self._after_should_hide)
+            self._unhooks += self.hook_all_methods(
+                ayu_cls, "isFiltered", after=self._after_is_filtered)
+        else:
+            self.log("未找到 AyuFilter 类，过滤记录不可用。")
+
+        adapter_cls = find_class("org.telegram.ui.ChatActivity$ChatActivityAdapter")
+        if adapter_cls is not None:
+            created = self.hook_all_methods(
+                adapter_cls, "onCreateViewHolder", after=self._after_create_holder)
+            bound = self.hook_all_methods(
+                adapter_cls, "onBindViewHolder", after=self._after_bind_holder)
+            self._unhooks += created + bound
+            self._placeholder_ok = bool(created) and bool(bound)
+        if not self._placeholder_ok:
+            self.log("ChatActivityAdapter hook 失败，原位占位条不可用。")
+
+    def _install_menus(self):
+        if MenuItemData is None:
+            return
+        try:
+            self.add_menu_item(MenuItemData(
+                MenuItemType.MESSAGE_CONTEXT_MENU,
+                "查看命中的过滤规则",
+                self._on_message_rules_click,
+                item_id=self.MENU_RULES_ID,
+                condition=self._message_menu_condition,
+                priority=90,
+            ))
+            self.add_menu_item(MenuItemData(
+                MenuItemType.CHAT_ACTION_MENU,
+                "重新隐藏已展开的消息",
+                self._on_collapse_all_click,
+                item_id=self.MENU_COLLAPSE_ID,
+                priority=91,
+            ))
+            self.add_menu_item(MenuItemData(
+                MenuItemType.CHAT_ACTION_MENU,
+                "本聊天 排除/恢复 过滤",
+                self._on_chat_toggle_click,
+                item_id=self.MENU_CHAT_TOGGLE_ID,
+                priority=92,
+            ))
+        except Exception as e:
+            self.log("菜单注册失败: %s" % e)
+
+    # ------------------------------------------------------------------
+    # shouldHideFilteredMessage：展开短路 + 记录
+    # ------------------------------------------------------------------
+    def _is_revealed(self, msg):
+        info = _msg_account_dialog(msg)
+        if info is None:
+            return False
+        with self._revealed_lock:
+            ids = self._revealed.get((info[0], info[1]))
+            return bool(ids and info[2] in ids)
+
+    def _before_should_hide(self, param):
+        try:
+            args = _param_args(param)
+            if args and args[0] is not None and self._is_revealed(args[0]):
+                _param_set_result(param, False)
+        except Exception as e:
+            self.log("shouldHide before 异常: %s" % e)
+
+    def _after_should_hide(self, param):
+        try:
+            args = _param_args(param)
+            if not args or args[0] is None:
+                return
+            msg = args[0]
+            # 已展开消息：覆盖宿主判定，保证 getItemViewType 返回正常类型
+            if self._is_revealed(msg):
+                if _param_result(param):
+                    _param_set_result(param, False)
+                return
+            if not _param_result(param):
+                return
+            self._record_filtered(msg)
+        except Exception as e:
+            self.log("shouldHide after 异常: %s" % e)
+
+    def _after_is_filtered(self, param):
+        try:
+            if not _param_result(param):
+                return
+            args = _param_args(param)
+            if args and args[0] is not None:
+                self._record_filtered(args[0])
+        except Exception as e:
+            self.log("isFiltered after 异常: %s" % e)
+
+    def _record_filtered(self, msg):
+        info = _msg_account_dialog(msg)
+        if info is None:
+            return
+        account, dialog_id, msg_id = info
+        matched = self.bridge.matched_rules_for(msg, dialog_id)
+        if matched is None:
+            return
+        rule_texts = ([rule_display_text(f) for f in matched.get("chat", [])]
+                      + [rule_display_text(f) for f in matched.get("shared", [])])
+        preview = self.bridge.get_message_text(msg)
+        self.store.record(account, dialog_id, msg_id, rule_texts, preview)
+        if not self._placeholder_ok:
+            self._bulletin_fallback_once(account, dialog_id)
+
+    def _bulletin_fallback_once(self, account, dialog_id):
+        key = (account, dialog_id)
+        if key in self._bulletin_fallback_chats:
+            return
+        self._bulletin_fallback_chats.add(key)
+        count = self.store.count(account, dialog_id)
+        try:
+            BulletinHelper.show_with_button(
+                "本聊天已过滤 %d 条消息" % count,
+                0,
+                "查看",
+                lambda: self._show_rules_dialog(account, dialog_id),
+                fragment=get_last_fragment(),
+            )
+        except Exception as e:
+            self.log("Bulletin 降级失败: %s" % e)
+
+    # ------------------------------------------------------------------
+    # 原位占位条：替换 DummyView
+    # ------------------------------------------------------------------
+    def _after_create_holder(self, param):
+        """onCreateViewHolder 返回 DummyView 时，整体替换为本插件的占位 TextView。"""
+        if not self.get_setting("placeholder_enabled", True):
+            return
+        try:
+            holder = _param_result(param)
+            if holder is None:
+                return
+            item_view = holder.itemView
+            if item_view is None:
+                return
+            if self.DUMMY_CLASS not in str(item_view.getClass().getName()):
+                return
+
+            args = _param_args(param)
+            context = args[0] if args else None  # ViewGroup parent
+            try:
+                context = context.getContext()
+            except Exception:
+                context = None
+            if context is None:
+                return
+
+            TextView = jclass("android.widget.TextView")
+            RecyclerView = jclass("androidx.recyclerview.widget.RecyclerView")
+            Holder = jclass("org.telegram.ui.Components.RecyclerListView$Holder")
+
+            view = TextView(context)
+            view.setTextColor(0xFF8A8A8A)
+            view.setBackgroundColor(0x14000000)
+            view.setTextSize(13.0)
+            view.setGravity(17)  # Gravity.CENTER
+            view.setPadding(0, 24, 0, 24)
+            view.setTag(self.PLACEHOLDER_TAG)
+            view.setLayoutParams(RecyclerView.LayoutParams(
+                RecyclerView.LayoutParams.MATCH_PARENT,
+                RecyclerView.LayoutParams.WRAP_CONTENT))
+
+            plugin = self
+
+            class _Click(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+                def onClick(self, v):
+                    plugin._on_placeholder_click(v)
+
+            class _LongClick(dynamic_proxy(jclass("android.view.View$OnLongClickListener"))):
+                def onLongClick(self, v):
+                    plugin._on_placeholder_long_click(v)
+                    return True
+
+            view.setOnClickListener(_Click())
+            view.setOnLongClickListener(_LongClick())
+
+            _param_set_result(param, Holder(view))
+        except Exception as e:
+            self.log("占位条创建失败: %s" % e)
+
+    def _adapter_messages(self, adapter):
+        """取当前生效的消息列表（公开字段，直接属性访问；失败走反射兜底）。"""
+        try:
+            if bool(adapter.isFiltered):
+                return adapter.filteredMessages
+            if bool(adapter.isFrozen):
+                return adapter.frozenMessages
+        except Exception:
+            pass
+        fragment = get_private_field(adapter, "this$0")
+        if fragment is None:
+            return None
+        try:
+            return fragment.messages
+        except Exception:
+            return get_private_field(fragment, "messages")
+
+    def _after_bind_holder(self, param):
+        """对本插件占位条做段探测：段首显示「已隐藏 N 条」，段内其余 GONE。"""
+        try:
+            args = _param_args(param)
+            if len(args) < 2:
+                return
+            holder = args[0]
+            view = holder.itemView
+            if view is None or view.getTag() != self.PLACEHOLDER_TAG:
+                return
+
+            adapter = _param_this(param)
+            position = int(args[1])
+            messages = self._adapter_messages(adapter)
+            if messages is None:
+                view.setVisibility(8)
+                return
+            size = int(messages.size())
+            try:
+                start_row = int(adapter.messagesStartRow)
+            except Exception:
+                start_row = 0
+            idx = position - start_row
+
+            def _filtered(i):
+                try:
+                    m = messages.get(i)
+                except Exception:
+                    return False
+                if m is None or _msg_hidden_by_owner(m):
+                    return False
+                return self.bridge.should_hide(m)
+
+            state, run = compute_placeholder_state(_filtered, size, idx)
+            if state != "head":
+                view.setVisibility(8)  # GONE（段内折叠或非正则隐藏，保持原 1px 语义）
+                return
+
+            msg_ids = []
+            account, dialog_id = 0, 0
+            for i in run:
+                info = _msg_account_dialog(messages.get(i))
+                if info is not None:
+                    account, dialog_id = info[0], info[1]
+                    msg_ids.append(info[2])
+
+            view.setVisibility(0)  # VISIBLE
+            view.setText(format_placeholder_text(len(run)))
+            self._view_meta[id(view)] = (adapter, account, dialog_id, msg_ids)
+        except Exception as e:
+            self.log("占位条绑定失败: %s" % e)
+
+    # ------------------------------------------------------------------
+    # 展开 / 收回
+    # ------------------------------------------------------------------
+    def _on_placeholder_click(self, view):
+        meta = self._view_meta.get(id(view))
+        if meta is None:
+            return
+        adapter, account, dialog_id, msg_ids = meta
+        if not msg_ids:
+            return
+        key = (account, dialog_id)
+        with self._revealed_lock:
+            ids = self._revealed.setdefault(key, set())
+            ids.update(msg_ids)
+        self._refresh_adapter(adapter)
+        count = len(msg_ids)
+        try:
+            BulletinHelper.show_with_button(
+                "已展开 %d 条被过滤的消息" % count,
+                0,
+                "收回",
+                lambda: self._collapse_revealed(account, dialog_id, adapter=adapter),
+                fragment=get_last_fragment(),
+            )
+        except Exception:
+            self._toast("已展开 %d 条（聊天菜单可收回）" % count)
+
+    def _on_placeholder_long_click(self, view):
+        meta = self._view_meta.get(id(view))
+        if meta is None:
+            return
+        _, account, dialog_id, _ = meta
+        self._show_rules_dialog(account, dialog_id)
+
+    def _collapse_revealed(self, account, dialog_id, adapter=None):
+        key = (account, dialog_id)
+        with self._revealed_lock:
+            had = bool(self._revealed.get(key))
+            self._revealed.pop(key, None)
+        if not had:
+            self._toast("当前没有已展开的消息")
+            return
+        if adapter is not None:
+            self._refresh_adapter(adapter)
+        else:
+            self.bridge.post_filters_updated(account)
+        self._toast("已重新隐藏")
+
+    def _refresh_adapter(self, adapter):
+        def _do():
+            try:
+                adapter.notifyDataSetChanged()
+            except Exception as e:
+                self.log("刷新列表失败: %s" % e)
+        run_on_ui_thread(_do)
+
+    def _on_collapse_all_click(self, context):
+        dialog_id = _ctx_get(context, "dialog_id")
+        account = _ctx_get(context, "account") or get_current_account()
+        if not dialog_id:
+            self._toast("无法获取当前聊天 ID", error=True)
+            return
+        self._collapse_revealed(int(account), int(dialog_id))
+
+    def _on_chat_toggle_click(self, context):
+        dialog_id = _ctx_get(context, "dialog_id")
+        account = _ctx_get(context, "account") or get_current_account()
+        if not dialog_id:
+            self._toast("无法获取当前聊天 ID", error=True)
+            return
+        dialog_id = int(dialog_id)
+        if self.bridge.is_dialog_excluded(dialog_id):
+            if self.bridge.set_dialog_excluded(dialog_id, False):
+                self.bridge.post_filters_updated(int(account))
+                self._toast("已恢复本聊天过滤")
+            else:
+                self._toast("操作失败", error=True)
+        else:
+            if self.bridge.set_dialog_excluded(dialog_id, True):
+                self.bridge.post_filters_updated(int(account))
+                self._toast("本聊天已排除过滤（过滤器设置页可管理）")
+            else:
+                self._toast("操作失败", error=True)
+
+    # ------------------------------------------------------------------
+    # 命中规则展示
+    # ------------------------------------------------------------------
+    def _show_rules_dialog(self, account, dialog_id):
+        snap = self.store.snapshot(account, dialog_id)
+        lines = []
+        if snap and snap["rules"]:
+            lines.append("本聊天被过滤 %d 条消息，命中规则：" % snap["count"])
+            lines.append("")
+            for i, r in enumerate(snap["rules"], 1):
+                lines.append("%d. %s" % (i, r))
+            if snap["previews"]:
+                lines.append("")
+                lines.append("【被过滤消息样例】")
+                for p in snap["previews"]:
+                    lines.append("· %s" % p)
+        else:
+            lines.append("当前会话尚未记录到被过滤的消息。")
+            lines.append("（记录从插件加载后开始累积）")
+        text = "\n".join(lines)
+        self._show_dialog("命中的过滤规则", text, copyable=True)
+
+    def _message_menu_condition(self, context):
+        try:
+            if not self.get_setting("menu_only_filtered", True):
+                return True
+            msg = _ctx_get(context, "message")
+            if msg is None:
+                return False
+            dialog_id = int(msg.getDialogId())
+            matched = self.bridge.matched_rules_for(msg, dialog_id)
+            if matched is None:
+                return False
+            return bool(matched.get("chat") or matched.get("shared"))
+        except Exception:
+            return True
+
+    def _on_message_rules_click(self, context):
+        msg = _ctx_get(context, "message")
+        if msg is None:
+            self._toast("无法获取消息对象", error=True)
+            return
+        try:
+            dialog_id = int(msg.getDialogId())
+        except Exception:
+            dialog_id = int(_ctx_get(context, "dialog_id") or 0)
+        matched = self.bridge.matched_rules_for(msg, dialog_id)
+        if matched is None:
+            self._show_dialog("命中的过滤规则",
+                              "过滤器未启用，或该消息没有可匹配文本。", copyable=False)
+            return
+        report = format_rules_report(matched, dialog_id=dialog_id)
+        self._show_dialog("命中的过滤规则", report, copyable=True)
+
+    # ------------------------------------------------------------------
+    # 通用 UI 工具
+    # ------------------------------------------------------------------
+    def _show_dialog(self, title, message, copyable=False):
+        if AlertDialogBuilder is None:
+            self.log("%s: %s" % (title, message))
+            return
+
+        def _do():
+            try:
+                fragment = get_last_fragment()
+                if fragment is None or fragment.getParentActivity() is None:
+                    copy_to_clipboard(message)
+                    return
+                builder = AlertDialogBuilder(fragment.getParentActivity())
+                builder.set_title(str(title))
+                builder.set_message(str(message))
+                if copyable:
+                    builder.set_positive_button("复制", lambda *_: copy_to_clipboard(message))
+                builder.set_negative_button("关闭", lambda *_: None)
+                builder.show()
+            except Exception as e:
+                self.log("弹窗失败: %s" % e)
+
+        run_on_ui_thread(_do)
+
+    def _toast(self, message, error=False):
+        if BulletinHelper is None:
+            self.log(message)
+            return
+        try:
+            if error:
+                BulletinHelper.show_error(str(message), fragment=get_last_fragment())
+            else:
+                BulletinHelper.show_success(str(message), fragment=get_last_fragment())
+        except Exception as e:
+            self.log("提示失败: %s" % e)
+
+    # ------------------------------------------------------------------
+    # 设置页
+    # ------------------------------------------------------------------
+    def create_settings(self):
+        if Header is None:
+            return []
+
+        def status_subtext():
+            return "已展开 %d 个聊天的消息；占位条 %s" % (
+                len(self._revealed),
+                "可用" if self._placeholder_ok else "不可用（已降级 Bulletin）")
+
+        return [
+            Header(text="过滤器哨兵"),
+            Switch(key="placeholder_enabled", text="原位占位条", default=True,
+                   subtext="在被过滤消息的原位置显示「已隐藏 N 条」单行提示；"
+                           "连续过滤自动合并为一条；关闭后占位条不再替换 1px 隐藏"),
+            Switch(key="menu_only_filtered", text="菜单仅对被过滤消息显示", default=True,
+                   subtext="长按消息的「查看命中的过滤规则」仅在消息命中规则时出现"),
+            Divider(),
+            Text(text="运行状态", subtext=status_subtext()),
+            Text(text="重新隐藏全部已展开的消息",
+                 subtext="收回本插件展开的所有被过滤消息",
+                 on_click=lambda *a: self._collapse_everything()),
+            Text(text="清空全部记录",
+                 subtext="清除本插件累计的被过滤消息统计（不影响过滤器本身）",
+                 on_click=lambda *a: self._clear_all()),
+        ]
+
+    def _collapse_everything(self):
+        with self._revealed_lock:
+            keys = list(self._revealed.keys())
+            self._revealed.clear()
+        for account, _ in keys:
+            self.bridge.post_filters_updated(account)
+        self._toast("已全部重新隐藏")
+
+    def _clear_all(self):
+        self.store.clear_all()
+        self._toast("已清空过滤器哨兵的记录")
