@@ -28,7 +28,7 @@ __description__ = (
     "默认使用 Nullgram 公共域名，也可填自建域名。"
 )
 __author__ = "ljili (port of qwq233/Nullgram)"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import base64
 import ipaddress
@@ -189,6 +189,72 @@ class WsError(Exception):
     pass
 
 
+def ws_connect(host, use_tls, user_agent, conn_hash, timeout=3.0, insecure=False, port=None):
+    """与 wss://host/api 建立 WebSocket，返回 (socket, 握手时多读的残留字节)。
+
+    任何失败路径都会关闭已打开的 socket，避免 fd 泄漏。
+    """
+    if port is None:
+        port = 443 if use_tls else 80
+    sock = None
+    try:
+        raw = socket.create_connection((host, port), timeout=timeout)
+        if use_tls:
+            if insecure:
+                ctx = ssl._create_unverified_context()  # noqa: SLF001（设置项，默认关闭）
+            else:
+                ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(raw, server_hostname=host)
+        else:
+            sock = raw
+        sock.settimeout(timeout)
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            "GET /api HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "Sec-WebSocket-Protocol: binary\r\n"
+            "User-Agent: %s\r\n"
+            "Conn-Hash: %s\r\n"
+            "\r\n"
+        ) % (host, key, user_agent, conn_hash)
+        sock.sendall(req.encode("ascii"))
+
+        # 读响应头（上限 16 KB，防异常对端）。
+        # 注意：对端可能把 101 响应头与首批 WS 帧放在同一个 TCP 段里，
+        # 必须保留 \r\n\r\n 之后的残留字节并交还给帧解析器，不能丢弃。
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise WsError("eof during handshake")
+            resp += chunk
+            if len(resp) > 16384:
+                raise WsError("handshake response too large")
+        head, leftover = resp.split(b"\r\n\r\n", 1)
+        try:
+            status_line = head.split(b"\r\n", 1)[0].decode("latin-1")
+            status_code = int(status_line.split(" ", 2)[1])
+        except Exception:
+            raise WsError("bad handshake response: %r" % head[:80])
+        if status_code != 101:
+            raise WsError("handshake rejected: HTTP %d" % status_code)
+
+        sock.settimeout(None)  # 进入长连接模式，阻塞读
+        return sock, leftover
+    except Exception:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        raise
+
+
 def _recv_exact(sock, n):
     buf = b""
     while len(buf) < n:
@@ -199,64 +265,28 @@ def _recv_exact(sock, n):
     return buf
 
 
-def ws_connect(host, use_tls, user_agent, conn_hash, timeout=5.0, insecure=False):
-    """与 wss://host/api 建立 WebSocket，返回已就绪的 socket。"""
-    port = 443 if use_tls else 80
-    raw = socket.create_connection((host, port), timeout=timeout)
-    if use_tls:
-        if insecure:
-            ctx = ssl._create_unverified_context()  # noqa: SLF001（设置项，默认关闭）
-        else:
-            ctx = ssl.create_default_context()
-        sock = ctx.wrap_socket(raw, server_hostname=host)
-    else:
-        sock = raw
-    sock.settimeout(timeout)
-
-    key = base64.b64encode(os.urandom(16)).decode("ascii")
-    req = (
-        "GET /api HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: %s\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "Sec-WebSocket-Protocol: binary\r\n"
-        "User-Agent: %s\r\n"
-        "Conn-Hash: %s\r\n"
-        "\r\n"
-    ) % (host, key, user_agent, conn_hash)
-    sock.sendall(req.encode("ascii"))
-
-    # 读响应头（上限 16 KB，防异常对端）
-    resp = b""
-    while b"\r\n\r\n" not in resp:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise WsError("eof during handshake")
-        resp += chunk
-        if len(resp) > 16384:
-            raise WsError("handshake response too large")
-    head = resp.split(b"\r\n\r\n", 1)[0]
-    try:
-        status_line = head.split(b"\r\n", 1)[0].decode("latin-1")
-        status_code = int(status_line.split(" ", 2)[1])
-    except Exception:
-        raise WsError("bad handshake response: %r" % head[:80])
-    if status_code != 101:
-        raise WsError("handshake rejected: HTTP %d" % status_code)
-
-    sock.settimeout(None)  # 进入长连接模式，阻塞读
-    return sock
-
-
 class WsConn(object):
-    """封装一条已建立的 WebSocket：发送加锁（数据帧与 pong 会并发）。"""
+    """封装一条已建立的 WebSocket：发送加锁（数据帧与 pong 会并发）。
 
-    def __init__(self, sock):
+    prebuffer：握手阶段多读的字节（101 响应头之后同段的 WS 帧），
+    在 recv_message 中优先消费。
+    """
+
+    def __init__(self, sock, prebuffer=b""):
         self.sock = sock
+        self._buf = bytearray(prebuffer)
         self.send_lock = threading.Lock()
         self.closed = False
+
+    def _read_exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(max(4096, n - len(self._buf)))
+            if not chunk:
+                raise WsError("unexpected eof")
+            self._buf += chunk
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
 
     def _send_frame(self, opcode, payload):
         # 客户端帧必须带 mask
@@ -290,26 +320,26 @@ class WsConn(object):
             pass
 
     def recv_message(self):
-        """返回下一条完整二进制消息（bytes）；连接关闭返回 None。
-        自动处理分片、ping、pong、close。"""
+        """返回 (kind, payload)：kind 为 'data' / 'closed'（对端 close 帧）。
+        自动处理分片、ping、pong；连接异常抛异常。"""
         fragments = []
         while True:
-            hdr = _recv_exact(self.sock, 2)
+            hdr = self._read_exact(2)
             fin = hdr[0] & 0x80
             opcode = hdr[0] & 0x0F
             masked = hdr[1] & 0x80
             length = hdr[1] & 0x7F
             if length == 126:
-                length = struct.unpack(">H", _recv_exact(self.sock, 2))[0]
+                length = struct.unpack(">H", self._read_exact(2))[0]
             elif length == 127:
-                length = struct.unpack(">Q", _recv_exact(self.sock, 8))[0]
-            mask = _recv_exact(self.sock, 4) if masked else None
-            payload = _recv_exact(self.sock, length) if length else b""
+                length = struct.unpack(">Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else None
+            payload = self._read_exact(length) if length else b""
             if mask:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
             if opcode == 0x8:  # close
-                return None
+                return "closed", payload
             if opcode == 0x9:  # ping -> pong
                 self.send_pong(payload)
                 continue
@@ -318,10 +348,10 @@ class WsConn(object):
             if opcode in (0x0, 0x1, 0x2):  # continuation / text / binary
                 fragments.append(payload)
                 if fin:
-                    return b"".join(fragments)
+                    return "data", b"".join(fragments)
                 continue
-            # 未知 opcode：按规范应失败，这里直接断开
-            return None
+            # 未知 opcode：按规范应失败
+            raise WsError("unknown opcode %d" % opcode)
 
     def close(self):
         if not self.closed:
@@ -354,6 +384,7 @@ class Relay(object):
         self._accept_thread = None
         self._stopping = threading.Event()
         self._lock = threading.Lock()
+        self._tunnels = set()  # (client_sock, WsConn) 存活隧道，stop 时统一拆除
         self.tunnels_open = 0
         self.tunnels_total = 0
         self.last_error = ""
@@ -406,12 +437,22 @@ class Relay(object):
             self._stopping.set()
             srv = self._server_sock
             self._server_sock = None
+            tunnels = list(self._tunnels)
         if srv is not None:
             try:
                 srv.close()
             except Exception:
                 pass
-        self.log("tcp2ws stopped")
+        for client, ws in tunnels:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.log("tcp2ws stopped (tore down %d tunnels)" % len(tunnels))
 
     # ---- accept ----
     def _accept_loop(self):
@@ -422,6 +463,11 @@ class Relay(object):
                 continue
             except OSError:
                 break
+            except Exception as e:  # 防 accept 线程静默死亡
+                self.last_error = "accept error: %s" % e
+                self.log(self.last_error)
+                time.sleep(0.1)
+                continue
             threading.Thread(target=self._handle_client_safe,
                              args=(client,), name="wsproxy-client",
                              daemon=True).start()
@@ -481,22 +527,31 @@ class Relay(object):
             self._socks5_reply(client, 0x04)
             return
 
-        with self._lock:
-            self.tunnels_open += 1
-            self.tunnels_total += 1
-
-        try:
-            ws_sock = ws_connect(server, self.use_tls, self.user_agent,
-                                 self.conn_hash, insecure=self.insecure_tls)
-        except Exception as e:
-            self.last_error = "ws dial %s failed: %s" % (server, e)
+        # 快速重试：预算必须小于 tgnet 代理连接超时（8s），2 次 × 3s = 6s
+        ws_sock = None
+        leftover = b""
+        last_err = None
+        for attempt in (1, 2):
+            try:
+                ws_sock, leftover = ws_connect(
+                    server, self.use_tls, self.user_agent, self.conn_hash,
+                    timeout=3.0, insecure=self.insecure_tls)
+                break
+            except Exception as e:
+                last_err = e
+        if ws_sock is None:
+            self.last_error = "ws dial %s failed: %s" % (server, last_err)
             self.log(self.last_error)
             self._socks5_reply(client, 0x05)
             return
 
+        with self._lock:
+            self.tunnels_open += 1
+            self.tunnels_total += 1
+
         self._socks5_reply(client, 0x00)
         client.settimeout(None)
-        self._bridge(client, WsConn(ws_sock), server)
+        self._bridge(client, WsConn(ws_sock, leftover), server)
 
     @staticmethod
     def _socks5_auth(client):
@@ -516,16 +571,24 @@ class Relay(object):
     def _bridge(self, client, ws, server):
         started = time.time()
         done = threading.Event()
+        stats = {"c2w": 0, "w2c": 0, "by": None}
+
+        with self._lock:
+            self._tunnels.add((client, ws))
 
         def client_to_ws():
             try:
                 while not done.is_set():
                     data = client.recv(32768)
                     if not data:
+                        if stats["by"] is None:
+                            stats["by"] = "client-eof"
                         break
+                    stats["c2w"] += len(data)
                     ws.send_binary(data)
-            except Exception:
-                pass
+            except Exception as e:
+                if stats["by"] is None:
+                    stats["by"] = "client-err:%s" % type(e).__name__
             finally:
                 done.set()
 
@@ -533,13 +596,17 @@ class Relay(object):
         t.start()
         try:
             while not done.is_set():
-                msg = ws.recv_message()
-                if msg is None:
+                kind, payload = ws.recv_message()
+                if kind == "closed":
+                    if stats["by"] is None:
+                        stats["by"] = "server-close"
                     break
-                if msg:
-                    client.sendall(msg)
-        except Exception:
-            pass
+                if payload:
+                    stats["w2c"] += len(payload)
+                    client.sendall(payload)
+        except Exception as e:
+            if stats["by"] is None:
+                stats["by"] = "server-err:%s" % type(e).__name__
         finally:
             done.set()
             ws.close()
@@ -547,9 +614,11 @@ class Relay(object):
                 client.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
+            with self._lock:
+                self._tunnels.discard((client, ws))
             age = time.time() - started
-            if age < 5.0:  # 短死连接记录一下，便于排障
-                self.log("tunnel to %s closed after %.1fs" % (server, age))
+            self.log("tunnel %s closed by=%s age=%.1fs c2w=%dB w2c=%dB"
+                     % (server, stats["by"], age, stats["c2w"], stats["w2c"]))
 
 
 # ---------------------------------------------------------------------------
