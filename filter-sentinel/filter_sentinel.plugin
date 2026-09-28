@@ -31,6 +31,19 @@ v2.1 修复（针对「过滤后没有任何提示」的真机报告）：
   - 加载即显示状态 Bulletin，组件失败一目了然；
   - 各 hook 增加触发计数，设置页可查看诊断信息。
 
+v2.5 修复（针对「点击后占位条消失、消息不出现」的真机报告）：
+  - 宿主 getItemViewType 的隐藏判定不止 shouldHideFilteredMessage：
+    ① isIgnoredBlockedMessage（屏蔽/拉黑用户，ignoreBlocked 路径）
+    ② 合集(相册)用组内主消息判定。旧版只短路正则路径，导致这两条
+    路径隐藏的消息展开后宿主仍返回 -1000，而桥接段探测已判定
+    「未过滤」把占位条 GONE —— 条没了、消息也没了。现 hook
+    isIgnoredBlockedMessage 对已展开 id 短路；段探测同时覆盖屏蔽
+    路径；展开时把同合集成员 id 一并加入展开集；
+  - bind 分歧兜底：占位条存在即宿主仍在隐藏本条，若桥接判定不到
+    （未知隐藏路径），保留单条占位条而非 GONE，杜绝「两头空」；
+  - 长按看规则：未命中正则规则时检测并提示 ignoreBlocked 屏蔽隐藏；
+  - 诊断新增 ib_short（屏蔽路径短路计数）与 divergent_binds。
+
 依赖：仅插件 SDK（base_plugin / hook_utils / client_utils / ui.*），
 不需要第三方 Python 包。
 """
@@ -43,7 +56,7 @@ __description__ = (
     "消息长按菜单可查看单条消息的命中规则。"
 )
 __author__ = "ljili"
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 import threading
 import time
@@ -428,6 +441,30 @@ class AyuBridge(object):
         except Exception:
             return False
 
+    def is_ignored_blocked(self, msg):
+        """ignoreBlocked 路径：发送者被屏蔽/拉黑导致的隐藏。"""
+        try:
+            return bool(self.ayu.isIgnoredBlockedMessage(msg))
+        except Exception:
+            return False
+
+    def hide_ignored_blocked_enabled(self):
+        try:
+            return bool(self.ayu.shouldHideIgnoredBlockedMessages())
+        except Exception:
+            return False
+
+    def hidden_for_bar(self, msg):
+        """段探测用：本条是否会被宿主隐藏（正则过滤或屏蔽用户路径）。
+
+        宿主 getItemViewType 对两条路径都返回 -1000；占位条只替换
+        -1000，因此段探测必须同时覆盖，否则展开后桥接判定「未过滤」
+        会把占位条 GONE 而宿主仍在隐藏（条没了、消息也没了）。
+        """
+        if self.should_hide(msg):
+            return True
+        return self.hide_ignored_blocked_enabled() and self.is_ignored_blocked(msg)
+
     def post_filters_updated(self, account):
         try:
             nc_cls = self.notification_center
@@ -574,6 +611,8 @@ class FilterSentinelPlugin(BasePlugin):
             "cm_hooks": 0,           # createMenu hook 数
             "cm_calls": 0,           # createMenu 回调次数
             "cm_tag_hits": 0,        # createMenu 中命中占位条的次数
+            "ib_short": 0,           # isIgnoredBlockedMessage 展开短路次数
+            "divergent_binds": 0,    # 桥接判定不到但宿主仍隐藏的兜底绑定次数
         }
 
     # ------------------------------------------------------------------
@@ -583,7 +622,7 @@ class FilterSentinelPlugin(BasePlugin):
         self._install_hooks()
         self._install_menus()
         status = self._status_line()
-        self.log("过滤器哨兵 v2.4 已加载：%s" % status)
+        self.log("过滤器哨兵 v2.5 已加载：%s" % status)
         self._show_load_bulletin(status)
 
     def on_plugin_unload(self):
@@ -630,8 +669,13 @@ class FilterSentinelPlugin(BasePlugin):
                 after=self._after_should_hide)
             h2 = self.hook_all_methods(
                 ayu_cls, "isFiltered", after=self._after_is_filtered)
-            self._unhooks += h1 + h2
-            self.diag["ayu_hooks"] = len(h1) + len(h2)
+            # ignoreBlocked（屏蔽/拉黑用户）是独立于正则的第二条隐藏路径，
+            # 同样会导致 -1000；展开时必须一并短路，否则消息永不出现。
+            h3 = self.hook_all_methods(
+                ayu_cls, "isIgnoredBlockedMessage",
+                before=self._before_ignored_blocked)
+            self._unhooks += h1 + h2 + h3
+            self.diag["ayu_hooks"] = len(h1) + len(h2) + len(h3)
         else:
             self.log("未找到 AyuFilter 类，过滤记录不可用。")
 
@@ -764,6 +808,16 @@ class FilterSentinelPlugin(BasePlugin):
                 _param_set_result(param, False)
         except Exception as e:
             self.log("shouldHide before 异常: %s" % e)
+
+    def _before_ignored_blocked(self, param):
+        """ignoreBlocked 隐藏路径的展开短路（与 _before_should_hide 同理）。"""
+        try:
+            args = _param_args(param)
+            if args and args[0] is not None and self._is_revealed(args[0]):
+                self.diag["ib_short"] += 1
+                _param_set_result(param, False)
+        except Exception as e:
+            self.log("isIgnoredBlocked before 异常: %s" % e)
 
     def _after_should_hide(self, param):
         try:
@@ -965,11 +1019,22 @@ class FilterSentinelPlugin(BasePlugin):
                     return False
                 if m is None or _msg_hidden_by_owner(m):
                     return False
-                return self.bridge.should_hide(m)
+                return self.bridge.hidden_for_bar(m)
 
             state, run = compute_placeholder_state(_filtered, size, idx)
+            if state == "gone" and 0 <= idx < size:
+                # 分歧兜底：能绑定到占位条 ⟹ 宿主对本条返回了 -1000，
+                # 但桥接未判定出任何已知隐藏路径（未知路径）。
+                # 保留单条占位条，避免「占位条消失、消息也不出现」。
+                try:
+                    m = messages.get(idx)
+                except Exception:
+                    m = None
+                if m is not None and not _msg_hidden_by_owner(m):
+                    state, run = "head", [idx]
+                    self.diag["divergent_binds"] += 1
             if state != "head":
-                view.setVisibility(8)  # GONE（段内折叠或非正则隐藏，保持原 1px 语义）
+                view.setVisibility(8)  # GONE（段内折叠或手动隐藏，保持原 1px 语义）
                 self._clear_bar(view)
                 return
 
@@ -994,6 +1059,46 @@ class FilterSentinelPlugin(BasePlugin):
     # ------------------------------------------------------------------
     # 展开 / 收回
     # ------------------------------------------------------------------
+    def _expand_with_group_members(self, adapter, msg_ids):
+        """合集(相册)整组展开：宿主对合集用组内主消息调 shouldHide，
+        只展开段内成员 id 短路不到主消息；把同组所有成员 id 一并加入。"""
+        messages = self._adapter_messages(adapter)
+        if messages is None or not msg_ids:
+            return msg_ids
+        wanted = set(msg_ids)
+        try:
+            size = int(messages.size())
+        except Exception:
+            return msg_ids
+        group_ids = set()
+        for i in range(size):
+            try:
+                m = messages.get(i)
+                gid = int(m.getGroupId())
+            except Exception:
+                continue
+            if not gid:
+                continue
+            info = _msg_account_dialog(m)
+            if info is not None and info[2] in wanted:
+                group_ids.add(gid)
+        if not group_ids:
+            return msg_ids
+        out = list(msg_ids)
+        seen = set(out)
+        for i in range(size):
+            try:
+                m = messages.get(i)
+                gid = int(m.getGroupId())
+            except Exception:
+                continue
+            if gid and gid in group_ids:
+                info = _msg_account_dialog(m)
+                if info is not None and info[2] not in seen:
+                    seen.add(info[2])
+                    out.append(info[2])
+        return out
+
     def _on_bar_click(self, meta):
         self.diag["click_fires"] += 1
         adapter, account, dialog_id, msg_ids = meta
@@ -1002,6 +1107,7 @@ class FilterSentinelPlugin(BasePlugin):
             self.log("占位条点击无效：msg_ids 为空（bind 时未能取得消息 ID）")
             self._toast("展开失败：无法定位被过滤消息", error=True)
             return
+        msg_ids = self._expand_with_group_members(adapter, msg_ids)
         key = (account, dialog_id)
         with self._revealed_lock:
             ids = self._revealed.setdefault(key, set())
@@ -1025,6 +1131,8 @@ class FilterSentinelPlugin(BasePlugin):
         adapter, account, dialog_id, msg_ids = meta
         self.log("占位条长按: dialog=%s, 实时判定 %d 条消息的命中规则" % (
             dialog_id, len(msg_ids)))
+        # 合集按主消息判定隐藏，重算时把同组成员一并纳入
+        msg_ids = self._expand_with_group_members(adapter, msg_ids)
         self._show_run_rules_dialog(adapter, account, dialog_id, msg_ids)
 
     def _show_run_rules_dialog(self, adapter, account, dialog_id, msg_ids):
@@ -1033,6 +1141,7 @@ class FilterSentinelPlugin(BasePlugin):
         chat_rules, shared_rules, previews = [], [], []
         seen_chat, seen_shared = set(), set()
         evaluated = 0
+        blocked_cnt = 0
         if messages is not None and msg_ids:
             wanted = set(msg_ids)
             try:
@@ -1047,6 +1156,8 @@ class FilterSentinelPlugin(BasePlugin):
                 info = _msg_account_dialog(m)
                 if info is None or info[2] not in wanted:
                     continue
+                if self.bridge.is_ignored_blocked(m):
+                    blocked_cnt += 1
                 matched = self.bridge.matched_rules_for(m, dialog_id)
                 if matched is None:
                     continue
@@ -1072,8 +1183,13 @@ class FilterSentinelPlugin(BasePlugin):
             lines.append("该段 %d 条消息未重算出命中规则。" % len(msg_ids))
             if evaluated == 0:
                 lines.append("（消息列表已变化或消息无可匹配文本）")
-            lines.append("可能原因：规则在消息到达后被修改/删除，")
-            lines.append("或合集(相册)按组判定而单条不命中。")
+            if blocked_cnt:
+                lines.append("其中 %d 条来自已屏蔽/拉黑的发送者：" % blocked_cnt)
+                lines.append("属 ignoreBlocked 隐藏而非正则规则，"
+                             "点击占位条可直接展开。")
+            else:
+                lines.append("可能原因：规则在消息到达后被修改/删除，")
+                lines.append("或合集(相册)按组判定而单条不命中。")
         else:
             lines.append("该段 %d 条被过滤消息共命中 %d 条规则：" % (
                 len(msg_ids), total))
@@ -1290,6 +1406,8 @@ class FilterSentinelPlugin(BasePlugin):
             "占位条长按回调: %d" % d["long_fires"],
             "展开操作: %d" % d["expands"],
             "shouldHide 展开短路: %d" % d["reveal_short"],
+            "屏蔽隐藏短路: %d" % d["ib_short"],
+            "分歧兜底绑定: %d" % d["divergent_binds"],
             "",
             "createMenu hook 数: %d" % d["cm_hooks"],
             "createMenu 回调: %d" % d["cm_calls"],
@@ -1307,6 +1425,9 @@ class FilterSentinelPlugin(BasePlugin):
             "· cm_calls 增但 cm_tag_hits=0 → 点击未落在占位条上",
             "· click_fires>0 且 expands>0 但界面无变化且 reveal_short=0 →",
             "  shouldHide 短路未生效（hook 引擎 setResult 问题）",
+            "· 点击后占位条消失但消息未出现 → 隐藏走了 ignoreBlocked 或",
+            "  合集主消息路径；看 ib_short 是否随点击增长",
+            "· divergent_binds>0 → 存在桥接未覆盖的隐藏路径（已兜底保留占位条）",
         ]
         self._show_dialog("过滤器哨兵诊断", "\n".join(lines), copyable=True)
 
