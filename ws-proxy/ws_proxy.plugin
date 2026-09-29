@@ -29,7 +29,7 @@ __description__ = (
     "默认使用 Nullgram 公共域名，也可填自建域名。"
 )
 __author__ = "ljili (port of qwq233/Nullgram)"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import base64
 import ipaddress
@@ -188,6 +188,135 @@ def lookup_server(ip_str, table, v6_prefix):
         except Exception:
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# 纯 Python AES-256-CTR（stdlib 无 AES；仅用于离线解码早夭隧道的入向头部，
+# 每次只解 ≤64B，性能无关紧要。正确性由测试向量锁定）
+# ---------------------------------------------------------------------------
+_SBOX = (
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+)
+
+
+def _aes256_expand_key(key):
+    """AES-256 密钥扩展，返回 15 个 16B 轮密钥的扁平 bytes（240B）。"""
+    assert len(key) == 32
+    nk, nr = 8, 14
+    words = [bytearray(key[4 * i:4 * i + 4]) for i in range(nk)]
+    rcon = 1
+    for i in range(nk, 4 * (nr + 1)):
+        temp = bytearray(words[i - 1])
+        if i % nk == 0:
+            temp = bytearray(_SBOX[b] for b in temp[1:] + temp[:1])
+            temp[0] ^= rcon
+            rcon = ((rcon << 1) ^ (0x11B if rcon & 0x80 else 0)) & 0xFF
+        elif i % nk == 4:
+            temp = bytearray(_SBOX[b] for b in temp)
+        words.append(bytearray(a ^ b for a, b in zip(words[i - nk], temp)))
+    return b"".join(bytes(w) for w in words)
+
+
+def _aes_encrypt_block(round_keys, block):
+    """单块 AES 加密（14 轮）。"""
+    state = bytearray(block)
+
+    def add_round_key(r):
+        for i in range(16):
+            state[i] ^= round_keys[16 * r + i]
+
+    def sub_bytes():
+        for i in range(16):
+            state[i] = _SBOX[state[i]]
+
+    def shift_rows():
+        s = state
+        s[1], s[5], s[9], s[13] = s[5], s[9], s[13], s[1]
+        s[2], s[6], s[10], s[14] = s[10], s[14], s[2], s[6]
+        s[3], s[7], s[11], s[15] = s[15], s[3], s[7], s[11]
+
+    def mix_columns():
+        for c in range(4):
+            i = 4 * c
+            a0, a1, a2, a3 = state[i], state[i + 1], state[i + 2], state[i + 3]
+            x0, x1, x2, x3 = (a0 << 1) ^ (0x1B if a0 & 0x80 else 0), \
+                             (a1 << 1) ^ (0x1B if a1 & 0x80 else 0), \
+                             (a2 << 1) ^ (0x1B if a2 & 0x80 else 0), \
+                             (a3 << 1) ^ (0x1B if a3 & 0x80 else 0)
+            state[i]     = (x0 ^ (x1 ^ a1) ^ a2 ^ a3) & 0xFF
+            state[i + 1] = (a0 ^ x1 ^ (x2 ^ a2) ^ a3) & 0xFF
+            state[i + 2] = (a0 ^ a1 ^ x2 ^ (x3 ^ a3)) & 0xFF
+            state[i + 3] = ((x0 ^ a0) ^ a1 ^ a2 ^ x3) & 0xFF
+
+    add_round_key(0)
+    for r in range(1, 14):
+        sub_bytes(); shift_rows(); mix_columns(); add_round_key(r)
+    sub_bytes(); shift_rows(); add_round_key(14)
+    return bytes(state)
+
+
+class Aes256Ctr(object):
+    """AES-256-CTR 流（计数器 128bit 大端自增，与 OpenSSL/cryptography 一致）。
+    加密解密同为 crypt()。"""
+
+    def __init__(self, key, iv):
+        self._rk = _aes256_expand_key(key)
+        self._ctr = int.from_bytes(iv, "big")
+        self._ks = b""
+        self._ks_pos = 0
+
+    def crypt(self, data):
+        out = bytearray()
+        for b in data:
+            if self._ks_pos >= len(self._ks):
+                self._ks = _aes_encrypt_block(
+                    self._rk, (self._ctr & ((1 << 128) - 1)).to_bytes(16, "big"))
+                self._ctr += 1
+                self._ks_pos = 0
+            out.append(b ^ self._ks[self._ks_pos])
+            self._ks_pos += 1
+        return bytes(out)
+
+
+def obfs2_decode_incoming(init64, data):
+    """用 tgnet 发来的 obfs2 init（线上前 64B）推导入向密钥并解密 data。
+
+    线上 init 形态为 明文[0:56]+密文[56:64]，其 [8:56] 为明文随机段；
+    入向（server->client）key/iv = reversed(init[8:56]) 的前 32B / 后 16B，
+    密钥流从位置 0 开始（与 telethon ObfuscatedIO 一致，已经真链路验证）。
+    init 不足 64B 时返回 None。
+    """
+    if len(init64) < 64:
+        return None
+    rev = init64[8:56][::-1]
+    return Aes256Ctr(rev[:32], rev[32:48]).crypt(data)
+
+
+def parse_abridged_err(plain, total_len):
+    """若 plain 是完整 abridged 小包（长度自洽且总长匹配），返回传输错误码 int 或 0。"""
+    if not plain:
+        return 0
+    n = plain[0]
+    if n == 0x7F or n == 0 or 1 + n * 4 != total_len:
+        return 0
+    if n == 1 and len(plain) >= 5:
+        return struct.unpack("<i", plain[1:5])[0]
+    return -1  # 自洽但非错误包
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +708,8 @@ class Relay(object):
     def _bridge(self, client, ws, server):
         started = time.time()
         done = threading.Event()
-        stats = {"c2w": 0, "w2c": 0, "by": None, "head": b"", "close": None}
+        stats = {"c2w": 0, "w2c": 0, "by": None, "head": b"", "close": None,
+                 "init": b""}
 
         with self._lock:
             self._tunnels.add((client, ws))
@@ -592,6 +722,10 @@ class Relay(object):
                         if stats["by"] is None:
                             stats["by"] = "client-eof"
                         break
+                    if stats["c2w"] < 64:
+                        # 前 64B 是 obfs2 init（tgnet 经 SOCKS5 也走混淆），
+                        # 留存以便关闭时解码入向头部
+                        stats["init"] += data[:64 - stats["c2w"]]
                     stats["c2w"] += len(data)
                     ws.send_binary(data)
             except Exception as e:
@@ -635,8 +769,20 @@ class Relay(object):
             age = time.time() - started
             extra = ""
             if 0 < stats["w2c"] <= 64:
-                # 早夭小流量隧道：头部 hex 可直接读出传输错误码
+                # 早夭小流量隧道：尝试用留存的 obfs2 init 解码入向头部，
+                # 读出 abridged 传输错误码（如 -404）；解不出则只给密文 hex
                 extra += " w2c_head=%s" % stats["head"].hex()
+                plain = None
+                try:
+                    plain = obfs2_decode_incoming(stats["init"], stats["head"])
+                except Exception:
+                    plain = None
+                if plain is not None:
+                    err = parse_abridged_err(plain, stats["w2c"])
+                    if err:
+                        extra += " mt_err=%d" % err
+                    else:
+                        extra += " w2c_plain=%s" % plain.hex()
             if stats["close"]:
                 extra += " close=%s" % stats["close"].hex()
             self.log("tunnel %s closed by=%s age=%.1fs c2w=%dB w2c=%dB%s"
