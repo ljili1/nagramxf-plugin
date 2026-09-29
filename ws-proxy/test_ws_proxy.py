@@ -34,8 +34,10 @@ CASES = [
     ("91.108.4.130", "vesta"), ("149.154.164.250", "vesta"),
     ("149.154.165.120", "vesta"), ("149.154.166.120", "vesta"),
     ("91.108.56.130", "flora"), ("111.62.91.36", "venus"),
-    # IPv6 /64 回退（同块未登记主机）
+    # IPv6 /64 回退（同块未登记主机；f002::b 为真机实测被拒案例）
     ("2001:67c:4e8:f004::b", "vesta"), ("2001:b28:f23f:f005::b", "flora"),
+    ("2001:67c:4e8:f002::b", "venus"), ("2001:b28:f23d:f001::b", "pluto"),
+    ("2001:b28:f23d:f003::b", "aurora"),
     # test DC
     ("149.154.175.10", "test_pluto"), ("149.154.175.40", "test_pluto"),
     ("149.154.167.40", "test_venus"), ("149.154.175.117", "test_aurora"),
@@ -50,7 +52,7 @@ for ip, want in CASES:
     print("%-4s %-28s -> %s (want %s)" % ("OK" if ok else "FAIL", ip, got, want))
 
 # 未登记地址必须拒绝（None），不得静默误路由
-for ip in ["149.154.167.100", "8.8.8.8", "2001:b28:f23d:f001::b"]:
+for ip in ["149.154.167.100", "8.8.8.8", "2001:b28:f23d:f009::b"]:
     got = m.lookup_server(ip, table, p6)
     if got is not None:
         fails += 1
