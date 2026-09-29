@@ -13,7 +13,8 @@ WS Proxy (tcp2ws) — Nullgram 的 WebSocket 代理功能移植为 NagramXF 插�
 路由表来源：qwq233/Nullgram libs/tcp2ws + docs/wsproxy/records.txt，
 并合入了以下修正：
   - 补 149.154.167.41（dc2 -> venus）精确行；
-  - dc4/dc5 的 IPv6 /64 前缀键（Telegram 会下发同块的 ::b 等未登记主机）；
+  - dc1-dc5 的 IPv6 /64 前缀键（Telegram 会下发同块的 ::b 等未登记主机，
+    真机案例 2001:67c:4e8:f002::b -> venus）；test 精确行仍优先命中；
   - 查表失败时按 SOCKS5 "Host unreachable" 拒绝（不回退裸 IP：
     裸 IP 的 wss 因 SNI 问题不可用，拒绝更快且更可诊断）。
 
@@ -28,7 +29,7 @@ __description__ = (
     "默认使用 Nullgram 公共域名，也可填自建域名。"
 )
 __author__ = "ljili (port of qwq233/Nullgram)"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import base64
 import ipaddress
@@ -96,7 +97,7 @@ def build_routes(domain):
       - 精确主机（IPv4 点分串 / IPv6 压缩串）；
       - 截尾前缀（如 "149.154.167.5"、"91.108.4."），
         由「截尾 0-3 个字符」查表算法命中。
-    v6_prefix_table 只对单 DC 独占的 /64 放前缀键（dc4/dc5）。
+    v6_prefix_table 对 5 个 DC 的 /64 都放前缀键（test 精确行优先命中）。
     """
     t = {}
 
@@ -151,8 +152,15 @@ def build_routes(domain):
     put6("2001:67c:4e8:f002::e", 18)
     put6("2001:b28:f23d:f003::e", 19)
 
-    # IPv6 /64 前缀键：只放单 DC 独占的块（f001/f002/f003 与 test 共用，不能放）
+    # IPv6 /64 前缀键。IPv6 /64 为单 DC 独占（prod 与 test 共用块，
+    # 但 test 的 ::e 等已登记主机会被前面的截尾精确查表先命中，不受影响；
+    # 未登记的 test 主机仅在测试模式下才可能出现，可接受）。
+    # 真机案例：Telegram 下发 2001:67c:4e8:f002::b（dc2），表内仅有 ::a/::d/::e，
+    # 截尾查不到即拒绝，必须靠 /64 回退覆盖。
     p6 = {}
+    p6["2001:b28:f23d:f001"] = "%s.%s" % (DC_SUBDOMAINS[1], domain)   # dc1
+    p6["2001:67c:4e8:f002"] = "%s.%s" % (DC_SUBDOMAINS[2], domain)   # dc2
+    p6["2001:b28:f23d:f003"] = "%s.%s" % (DC_SUBDOMAINS[3], domain)   # dc3
     p6["2001:67c:4e8:f004"] = "%s.%s" % (DC_SUBDOMAINS[4], domain)   # dc4 独占
     p6["2001:b28:f23f:f005"] = "%s.%s" % (DC_SUBDOMAINS[5], domain)   # dc5 独占
 
@@ -571,7 +579,7 @@ class Relay(object):
     def _bridge(self, client, ws, server):
         started = time.time()
         done = threading.Event()
-        stats = {"c2w": 0, "w2c": 0, "by": None}
+        stats = {"c2w": 0, "w2c": 0, "by": None, "head": b"", "close": None}
 
         with self._lock:
             self._tunnels.add((client, ws))
@@ -600,8 +608,16 @@ class Relay(object):
                 if kind == "closed":
                     if stats["by"] is None:
                         stats["by"] = "server-close"
+                    if payload:
+                        # close 帧载荷（2B 状态码 + 原因），
+                        # 如 DC 拒绝时会带 "        404\x00" 这类原因串
+                        stats["close"] = payload[:32]
                     break
                 if payload:
+                    if stats["w2c"] < 64:
+                        # 保留首批入向字节：早夭隧道的头部往往就是
+                        # abridged 传输错误包（如 01 6c fe ff ff = -404）
+                        stats["head"] += payload[:64 - stats["w2c"]]
                     stats["w2c"] += len(payload)
                     client.sendall(payload)
         except Exception as e:
@@ -617,8 +633,14 @@ class Relay(object):
             with self._lock:
                 self._tunnels.discard((client, ws))
             age = time.time() - started
-            self.log("tunnel %s closed by=%s age=%.1fs c2w=%dB w2c=%dB"
-                     % (server, stats["by"], age, stats["c2w"], stats["w2c"]))
+            extra = ""
+            if 0 < stats["w2c"] <= 64:
+                # 早夭小流量隧道：头部 hex 可直接读出传输错误码
+                extra += " w2c_head=%s" % stats["head"].hex()
+            if stats["close"]:
+                extra += " close=%s" % stats["close"].hex()
+            self.log("tunnel %s closed by=%s age=%.1fs c2w=%dB w2c=%dB%s"
+                     % (server, stats["by"], age, stats["c2w"], stats["w2c"], extra))
 
 
 # ---------------------------------------------------------------------------
