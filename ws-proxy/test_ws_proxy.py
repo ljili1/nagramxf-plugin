@@ -71,8 +71,48 @@ print("route table: %s (%d failures)" % ("PASS" if fails == 0 else "FAIL", fails
 if fails:
     sys.exit(1)
 
-# --- 2. 真实端点握手（101） ---------------------------------------------------
+# --- 1b. 纯 Python AES-256-CTR 与 obfs2 入向解码 ------------------------------
+import os
+# FIPS-197 附录 C.3 AES-256 测试向量
+_rk = m._aes256_expand_key(bytes(range(32)))
+_vec = m._aes_encrypt_block(
+    _rk, bytes.fromhex("00112233445566778899aabbccddeeff"))
+assert _vec.hex() == "8ea2b7ca516745bfeafc49904b496089", _vec.hex()
+print("aes256 block vector: PASS")
+
+# CTR 与 cryptography 交叉验证（本机有该包时）
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    _k, _iv = os.urandom(32), os.urandom(16)
+    _ref = Cipher(algorithms.AES(_k), modes.CTR(_iv)).encryptor().update(os.urandom(0) + b"\x00" * 100)
+    _mine = m.Aes256Ctr(_k, _iv).crypt(b"\x00" * 100)
+    assert _mine == _ref
+    print("aes256-ctr vs cryptography: PASS")
+except ImportError:
+    print("aes256-ctr vs cryptography: SKIP (no cryptography)")
+
+# obfs2 端到端：按 telethon 规则造 init，用「入向密钥」加密一个 -404 传输错误包，
+# 再用插件的解码函数解回并解析
+while True:
+    _init = bytearray(os.urandom(64))
+    if _init[0] != 0xEF and _init[:4] not in (b"PVrG", b"GET ", b"POST", b"\xee" * 4) \
+            and _init[4:8] != b"\0" * 4:
+        break
+_ekey, _eiv = bytes(_init[8:40]), bytes(_init[40:56])
+_rev = bytes(_init[8:56])[::-1]
+_dkey, _div = _rev[:32], _rev[32:48]
+_enc = m.Aes256Ctr(_ekey, _eiv)
+_enc_full = _enc.crypt(bytes(_init))          # 加密器消耗 64B 密钥流
+_wire_init = bytes(_init[:56]) + _enc_full[56:64]  # 线上形态: 明文头+密文尾
+_err_pkt = b"\x01" + struct.pack("<i", -404)  # abridged: len=1word + int32(-404)
+_ct = m.Aes256Ctr(_dkey, _div).crypt(_err_pkt)     # 入向密钥流从 0 开始
+_pt = m.obfs2_decode_incoming(_wire_init, _ct)
+assert _pt == _err_pkt, (_pt, _err_pkt)
+assert m.parse_abridged_err(_pt, 5) == -404
+assert m.parse_abridged_err(_pt, 6) == 0      # 总长不自洽不报
+print("obfs2 incoming decode + mt_err parse: PASS")
 print()
+
 target_host = "vesta." + DOMAIN
 try:
     sock, leftover = m.ws_connect(target_host, True, m.PLUGIN_UA, m.DEFAULT_CONN_HASH, timeout=8.0)
