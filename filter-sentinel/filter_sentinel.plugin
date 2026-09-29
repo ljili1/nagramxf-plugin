@@ -31,6 +31,19 @@ v2.1 修复（针对「过滤后没有任何提示」的真机报告）：
   - 加载即显示状态 Bulletin，组件失败一目了然；
   - 各 hook 增加触发计数，设置页可查看诊断信息。
 
+v2.6 修复（针对「点击后合并占位条变成单条占位条、仍非原文」）：
+  - 引擎源码核实：XposedBridge/XC_MethodHook 的 setResult 语义完整
+    （before returnEarly 跳过原方法、after 覆盖返回值，静态方法同样
+    生效），但宿主 -1000 存在不经任何已 hook 方法的分支
+    （messageOwner.hide 直接字段判定、合集主消息等），逐条中和判定
+    函数无法穷尽。改为 hook ChatActivityAdapter.getItemViewType
+    （after）：宿主返回 -1000 且该位置消息已展开时，直接改判为
+    msg.contentType —— 与宿主未隐藏时的返回值完全一致，与隐藏来源
+    解耦；同时对 -1000 做来源探测计数（owner/regex/ib/none），
+    真机一次即可定位隐藏分支；
+  - _adapter_messages 的 isFrozen/isFiltered 优先级修正为与宿主
+    getItemViewType 一致（isFrozen 优先）。
+
 v2.5 修复（针对「点击后占位条消失、消息不出现」的真机报告）：
   - 宿主 getItemViewType 的隐藏判定不止 shouldHideFilteredMessage：
     ① isIgnoredBlockedMessage（屏蔽/拉黑用户，ignoreBlocked 路径）
@@ -56,7 +69,7 @@ __description__ = (
     "消息长按菜单可查看单条消息的命中规则。"
 )
 __author__ = "ljili"
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import threading
 import time
@@ -613,6 +626,13 @@ class FilterSentinelPlugin(BasePlugin):
             "cm_tag_hits": 0,        # createMenu 中命中占位条的次数
             "ib_short": 0,           # isIgnoredBlockedMessage 展开短路次数
             "divergent_binds": 0,    # 桥接判定不到但宿主仍隐藏的兜底绑定次数
+            "gv_calls": 0,           # getItemViewType 回调次数
+            "gv_m1000": 0,           # getItemViewType 返回 -1000 次数
+            "gv_probe_owner": 0,     # -1000 来源探测：messageOwner.hide
+            "gv_probe_regex": 0,     # -1000 来源探测：正则过滤
+            "gv_probe_ib": 0,        # -1000 来源探测：屏蔽/拉黑用户
+            "gv_probe_none": 0,      # -1000 来源探测：均不命中（含已展开短路）
+            "gv_revealed_override": 0,  # 已展开消息改判为原生类型次数
         }
 
     # ------------------------------------------------------------------
@@ -622,7 +642,7 @@ class FilterSentinelPlugin(BasePlugin):
         self._install_hooks()
         self._install_menus()
         status = self._status_line()
-        self.log("过滤器哨兵 v2.5 已加载：%s" % status)
+        self.log("过滤器哨兵 v2.6 已加载：%s" % status)
         self._show_load_bulletin(status)
 
     def on_plugin_unload(self):
@@ -685,8 +705,13 @@ class FilterSentinelPlugin(BasePlugin):
                 adapter_cls, "onCreateViewHolder", after=self._after_create_holder)
             bound = self.hook_all_methods(
                 adapter_cls, "onBindViewHolder", after=self._after_bind_holder)
-            self._unhooks += created + bound
-            self.diag["adapter_hooks"] = len(created) + len(bound)
+            # 展开的最终保障：宿主 -1000 的分支不止一条且有的不经任何
+            # 方法调用（owner.hide 字段直读），逐条中和判定函数无法穷尽；
+            # 在 getItemViewType 出口对已展开消息直接改判为原生类型。
+            vtype = self.hook_all_methods(
+                adapter_cls, "getItemViewType", after=self._after_get_item_view_type)
+            self._unhooks += created + bound + vtype
+            self.diag["adapter_hooks"] = len(created) + len(bound) + len(vtype)
             self._placeholder_ok = bool(created) and bool(bound)
         else:
             self.log("未找到 ChatActivityAdapter 类。")
@@ -888,6 +913,60 @@ class FilterSentinelPlugin(BasePlugin):
         except Exception:
             pass
 
+    def _after_get_item_view_type(self, param):
+        """宿主返回 -1000 时：探测隐藏来源（诊断计数）；若该位置消息
+        已被本插件展开，直接改判为 msg.contentType（宿主未隐藏时的
+        返回值），与 -1000 的具体来源分支解耦。"""
+        try:
+            self.diag["gv_calls"] += 1
+            try:
+                result = int(_param_result(param))
+            except Exception:
+                return
+            if result != self.HIDDEN_VIEW_TYPE:
+                return
+            self.diag["gv_m1000"] += 1
+            args = _param_args(param)
+            if not args:
+                return
+            adapter = _param_this(param)
+            if adapter is None:
+                return
+            messages = self._adapter_messages(adapter)
+            if messages is None:
+                return
+            try:
+                position = int(args[0])
+                start_row = int(adapter.messagesStartRow)
+                m = messages.get(position - start_row)
+            except Exception:
+                return
+            if m is None:
+                return
+            # 来源探测（首次点击前的计数最能说明 -1000 来自哪条分支；
+            # 已展开消息因谓词短路会落入 none）
+            try:
+                if _msg_hidden_by_owner(m):
+                    self.diag["gv_probe_owner"] += 1
+                elif self.bridge.should_hide(m):
+                    self.diag["gv_probe_regex"] += 1
+                elif self.bridge.is_ignored_blocked(m):
+                    self.diag["gv_probe_ib"] += 1
+                else:
+                    self.diag["gv_probe_none"] += 1
+            except Exception:
+                pass
+            if not self._is_revealed(m):
+                return
+            try:
+                content_type = int(m.contentType)
+            except Exception:
+                return
+            if _param_set_result(param, content_type):
+                self.diag["gv_revealed_override"] += 1
+        except Exception as e:
+            self.log("getItemViewType after 异常: %s" % e)
+
     def _after_create_holder(self, param):
         """viewType == -1000（被过滤消息）时，把 DummyView 整体替换为占位条。"""
         try:
@@ -970,12 +1049,13 @@ class FilterSentinelPlugin(BasePlugin):
             self.log("占位条创建异常: %s" % e)
 
     def _adapter_messages(self, adapter):
-        """取当前生效的消息列表（公开字段，直接属性访问；失败走反射兜底）。"""
+        """取当前生效的消息列表（公开字段，直接属性访问；失败走反射兜底）。
+        分支优先级必须与宿主 getItemViewType 一致：isFrozen 在前。"""
         try:
-            if bool(adapter.isFiltered):
-                return adapter.filteredMessages
             if bool(adapter.isFrozen):
                 return adapter.frozenMessages
+            if bool(adapter.isFiltered):
+                return adapter.filteredMessages
         except Exception:
             pass
         fragment = get_private_field(adapter, "this$0")
@@ -1409,6 +1489,14 @@ class FilterSentinelPlugin(BasePlugin):
             "屏蔽隐藏短路: %d" % d["ib_short"],
             "分歧兜底绑定: %d" % d["divergent_binds"],
             "",
+            "getItemViewType 回调: %d" % d["gv_calls"],
+            "返回 -1000 次数: %d" % d["gv_m1000"],
+            "-1000 来源[手动hide]: %d" % d["gv_probe_owner"],
+            "-1000 来源[正则]: %d" % d["gv_probe_regex"],
+            "-1000 来源[屏蔽用户]: %d" % d["gv_probe_ib"],
+            "-1000 来源[均不命中]: %d" % d["gv_probe_none"],
+            "已展开改判类型: %d" % d["gv_revealed_override"],
+            "",
             "createMenu hook 数: %d" % d["cm_hooks"],
             "createMenu 回调: %d" % d["cm_calls"],
             "createMenu 命中占位条: %d" % d["cm_tag_hits"],
@@ -1428,6 +1516,10 @@ class FilterSentinelPlugin(BasePlugin):
             "· 点击后占位条消失但消息未出现 → 隐藏走了 ignoreBlocked 或",
             "  合集主消息路径；看 ib_short 是否随点击增长",
             "· divergent_binds>0 → 存在桥接未覆盖的隐藏路径（已兜底保留占位条）",
+            "· 点击后 gv_revealed_override 不增 → getItemViewType 改判未生效，",
+            "  看 gv_m1000 是否增长（不增说明宿主未重查类型，刷新问题）",
+            "· -1000 来源计数看首次点击前的分布：owner=手动隐藏、",
+            "  regex=正则、ib=屏蔽用户、none=已展开短路或未知分支",
         ]
         self._show_dialog("过滤器哨兵诊断", "\n".join(lines), copyable=True)
 
