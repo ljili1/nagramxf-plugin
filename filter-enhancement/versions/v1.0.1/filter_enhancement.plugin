@@ -1,0 +1,1020 @@
+"""Filter Enhancement (过滤器增强) — placeholder mode for regex-filtered messages.
+
+Port of the filter-enhancement patch set from ljili1/NagramXF (branch 12.10.1,
+commits 67b0380c "feat(filters): port AyuFilter regex message filtering from 12.9.2"
+and 533af9af "fix(filters): remove stray brace in MessageHelper filter match text")
+to the Keeperorowner/NagramXF Python plugin SDK (exteraGram-style).
+
+Feature parity with the original Java patch:
+  1. Hidden-by-filter messages render as a tappable placeholder bar (view type -1001)
+     instead of vanishing; tap reveals the original message(s) in place.
+  2. Consecutive placeholders merge into a single "N messages hidden" bar; one tap
+     reveals the whole run.
+  3. Long-press a placeholder shows WHY the message was hidden (matched text fragments).
+  4. A floating "Collapse" pill appears while any filtered message is revealed and
+     collapses all of them back.
+  5. Link-preview (webpage) content participates in regex matching, so rules that
+     target URLs shown only inside link previews actually hit.
+  6. Editing a message re-evaluates its filter verdict immediately (per-message cache
+     invalidation on content change) instead of after reopening the chat.
+  7. Toggling any filter option refreshes open chats immediately (invalidateFilteredCache
+     now also posts NotificationCenter.regexFiltersUpdated).
+  8. The upstream shadow-ban peer-chain hide (via_bot / fwd_from chains) is disabled,
+     matching the enhancement's removal of isShadowBannedPeerChain; a switch restores it.
+
+The plugin only hooks Java methods (Xposed-style, via the host's PyMethodHook);
+it ships no Java code and adds no resources. All placeholder strings are bundled
+below (zh-CN + en) because plugins cannot register R.string resources.
+"""
+
+__id__ = "filter_enhancement"
+__name__ = "Filter Enhancement"
+__version__ = "1.0.1"
+__author__ = "ljili1"
+__description__ = (
+    "Regex filter enhancement: tappable placeholders for hidden messages, merged "
+    "runs, tap-to-reveal, long-press filter reason, collapse pill, link-preview "
+    "matching, instant refresh on edit/toggle."
+)
+__min_version__ = "12.2.10"
+
+import re
+
+from java import jclass
+
+from base_plugin import BasePlugin, XposedHook
+import hook_utils
+from android_utils import (
+    dp,
+    log,
+    run_on_ui_thread,
+    get_string,
+    OnClickListener,
+    OnLongClickListener,
+    R,
+)
+from ui.settings import Header, Divider, Switch, Text
+from ui.alert import AlertDialogBuilder
+
+# ---------------------------------------------------------------------------
+# Java class references (resolved at import; all exist in the host app)
+# ---------------------------------------------------------------------------
+AyuFilter = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
+NaConfig = jclass("xyz.nextalone.nagram.NaConfig")
+ChatObject = jclass("org.telegram.messenger.ChatObject")
+NotificationCenter = jclass("org.telegram.messenger.NotificationCenter")
+UserConfig = jclass("org.telegram.messenger.UserConfig")
+LocaleController = jclass("org.telegram.messenger.LocaleController")
+AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+Theme = jclass("org.telegram.ui.ActionBar.Theme")
+LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+RecyclerListViewHolder = jclass("org.telegram.ui.Components.RecyclerListView$Holder")
+RecyclerViewLayoutParams = jclass("androidx.recyclerview.widget.RecyclerView$LayoutParams")
+FrameLayout = jclass("android.widget.FrameLayout")
+FrameLayoutParams = jclass("android.widget.FrameLayout$LayoutParams")
+TextView = jclass("android.widget.TextView")
+Gravity = jclass("android.view.Gravity")
+View = jclass("android.view.View")
+TypedValue = jclass("android.util.TypedValue")
+JavaSystem = jclass("java.lang.System")
+
+VIEW_TYPE_FILTER_PLACEHOLDER = -1001  # mirrors the Java patch; -1000 stays "fully hidden"
+
+_STRINGS = {
+    "zh": {
+        "hint": "已被过滤器隐藏，点击显示",
+        "merged_hint": "%d 条消息被过滤器隐藏，点击显示",
+        "collapse": "收起",
+        "non_text": "[非文本消息]",
+        "reason_title": "过滤原因",
+        "reason_text": "命中文本：",
+        "set_header": "过滤器增强",
+        "set_placeholder": "显示被过滤消息占位条",
+        "set_placeholder_about": "被过滤器隐藏的消息在原位置显示为可点击的占位条，点击即可恢复显示。关闭后恢复为直接隐藏。",
+        "set_merge": "合并连续占位条",
+        "set_merge_about": "连续被隐藏的多条消息合并为一条占位条，点击一次全部恢复。",
+        "set_pill": "显示「收起」悬浮按钮",
+        "set_pill_about": "恢复显示被过滤消息后，在聊天底部显示「收起」按钮，点击可重新隐藏全部已恢复的消息。",
+        "set_webpage": "链接预览内容参与匹配",
+        "set_webpage_about": "将链接预览（URL、站点名、标题、简介）纳入正则匹配范围，使针对预览内链接的规则能够命中。",
+        "set_shadow": "恢复链式屏蔽（上游行为）",
+        "set_shadow_about": "开启后恢复上游的 shadow-ban 链式隐藏（via_bot / 转发来源链）。默认关闭，与过滤器增强补丁行为一致。",
+        "set_note": "说明",
+        "set_note_about": "本插件是 ljili1/NagramXF「过滤器增强」补丁的插件化移植。过滤规则本身仍在 Nagram 设置 → 过滤器 中维护；本插件提供占位条、点击恢复、过滤原因、链接预览匹配与即时刷新等增强行为。",
+        "set_health": "钩子状态",
+        "set_health_ok": "%d/%d 已安装",
+        "set_health_bad": "%d/%d 已安装（存在缺失，部分功能已降级；请反馈宿主版本号）",
+    },
+    "en": {
+        "hint": "Hidden by the filter. Tap to show.",
+        "merged_hint": "%d messages hidden by the filter. Tap to show.",
+        "collapse": "Collapse",
+        "non_text": "[Non-text message]",
+        "reason_title": "Filter Reason",
+        "reason_text": "Matched text:",
+        "set_header": "Filter Enhancement",
+        "set_placeholder": "Show placeholder for hidden messages",
+        "set_placeholder_about": "Hidden-by-filter messages stay as a tappable placeholder at their original position. Tap to reveal. Off restores the plain hide behavior.",
+        "set_merge": "Merge consecutive placeholders",
+        "set_merge_about": "Consecutive hidden messages collapse into a single bar; one tap reveals the whole run.",
+        "set_pill": "Show floating Collapse button",
+        "set_pill_about": "While any filtered message is revealed, show a bottom pill that collapses all revealed messages.",
+        "set_webpage": "Match link-preview content",
+        "set_webpage_about": "Include link preview fields (URL, site name, title, description) in regex matching so rules targeting preview-only links can hit.",
+        "set_shadow": "Restore shadow-ban chain (upstream)",
+        "set_shadow_about": "Re-enables the upstream shadow-ban peer-chain hiding (via_bot / forward-source chains). Off matches the filter-enhancement patch.",
+        "set_note": "About",
+        "set_note_about": "Plugin port of the ljili1/NagramXF filter-enhancement patch. Filter rules themselves are still managed under Nagram Settings > Filters; this plugin adds placeholders, tap-to-reveal, filter reasons, link-preview matching and instant refresh.",
+        "set_health": "Hook status",
+        "set_health_ok": "%d/%d installed",
+        "set_health_bad": "%d/%d installed (some missing, features degraded; please report your host version)",
+    },
+}
+
+
+def _identity(obj):
+    try:
+        return int(JavaSystem.identityHashCode(obj))
+    except Exception:
+        return 0
+
+
+class FilterEnhancementPlugin(BasePlugin):
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+    def on_plugin_load(self):
+        # per-ChatActivity state: {activityHash: {"activity":a, "revealed":set, "pill":View, "views":{viewHash: vs}}}
+        self._states = {}
+        # global view registry: viewHash -> view-state dict
+        self._views = {}
+        # adapterHash -> ChatActivity (avoids repeated this$0 reflection on the hot path)
+        self._act_cache = {}
+        # edit-detection: {(dialogId, msgId): last evaluated text}
+        self._eval_src = {}
+        self._regex_cache = {}
+        self._unhooks = []
+        # health / robustness
+        self._hooks_total = 9
+        self._hooks_ok = 0
+        self._viewtype_hook_ok = False
+        self._holder_hook_ok = False
+        self._placeholder_broken = False
+        self._refresh_pending = False
+        self._install_hooks()
+        log("hooks installed: %d/%d" % (self._hooks_ok, self._hooks_total))
+
+    def on_plugin_unload(self):
+        for unhook in list(self._unhooks):
+            self.unhook_method(unhook)
+        self._unhooks = []
+        for st in list(self._states.values()):
+            self._remove_pill(st)
+            adapter = self._adapter_of(st.get("activity"))
+            if adapter is not None:
+                self._post_notify(adapter)
+        self._states = {}
+        self._views = {}
+        self._act_cache = {}
+        self._eval_src = {}
+
+    # ------------------------------------------------------------------
+    # settings
+    # ------------------------------------------------------------------
+    def create_settings(self):
+        tr = self._tr
+        return [
+            Header(tr("set_header")),
+            Switch(key="placeholder_enabled", text=tr("set_placeholder"), default=True,
+                   subtext=tr("set_placeholder_about"),
+                   on_change=lambda v: self._on_behavior_setting_changed()),
+            Switch(key="merge_runs", text=tr("set_merge"), default=True,
+                   subtext=tr("set_merge_about"),
+                   on_change=lambda v: self._on_behavior_setting_changed()),
+            Switch(key="collapse_pill", text=tr("set_pill"), default=True,
+                   subtext=tr("set_pill_about"),
+                   on_change=lambda v: self._on_pill_setting_changed()),
+            Switch(key="webpage_match", text=tr("set_webpage"), default=True,
+                   subtext=tr("set_webpage_about"),
+                   on_change=lambda v: self._on_behavior_setting_changed()),
+            Divider(),
+            Switch(key="shadow_chain_upstream", text=tr("set_shadow"), default=False,
+                   subtext=tr("set_shadow_about"),
+                   on_change=lambda v: self._on_behavior_setting_changed()),
+            Divider(),
+            Text(text=tr("set_note"), subtext=tr("set_note_about")),
+            Text(text=tr("set_health"),
+                 subtext=(tr("set_health_ok") if self._hooks_ok >= self._hooks_total
+                          else tr("set_health_bad")) % (self._hooks_ok, self._hooks_total),
+                 red=self._hooks_ok < self._hooks_total),
+        ]
+
+    def _on_behavior_setting_changed(self):
+        # Filter verdicts / view types depend on these; invalidate + refresh open chats.
+        try:
+            AyuFilter.invalidateFilteredCache()  # our after-hook posts regexFiltersUpdated
+        except Exception as e:
+            log("invalidateFilteredCache failed: %s" % e)
+        run_on_ui_thread(self._notify_all_adapters)
+
+    def _on_pill_setting_changed(self):
+        run_on_ui_thread(self._update_all_pills)
+
+    # ------------------------------------------------------------------
+    # hook installation
+    # ------------------------------------------------------------------
+    def _install_hooks(self):
+        adapter_cls = hook_utils.find_class("org.telegram.ui.ChatActivity$ChatActivityAdapter")
+        chat_cls = hook_utils.find_class("org.telegram.ui.ChatActivity")
+        msg_helper_cls = hook_utils.find_class("tw.nekomimi.nekogram.helpers.MessageHelper")
+        ayu_filter_cls = hook_utils.find_class("tw.nekomimi.nekogram.filters.AyuFilter")
+        msg_obj_cls = hook_utils.find_class("org.telegram.messenger.MessageObject")
+
+        # 1) view type: -1000 (hidden) -> -1001 (placeholder) / native type (revealed)
+        self._viewtype_hook_ok = self._hook(
+            adapter_cls, "getItemViewType", 1, after=self._after_get_item_view_type)
+        # 2) create the placeholder view for view type -1001
+        self._holder_hook_ok = self._hook(
+            adapter_cls, "onCreateViewHolder", 2, before=self._before_create_view_holder)
+        # 3) bind placeholder (merged-run hint / follower collapse)
+        self._hook(adapter_cls, "onBindViewHolder", 2, after=self._after_bind_view_holder)
+        # 4) attach the floating collapse pill; cleanup on destroy
+        self._hook(chat_cls, "createView", 1, after=self._after_create_view)
+        self._hook(chat_cls, "onFragmentDestroy", 0, after=self._after_fragment_destroy)
+        # 5) webpage (link preview) content participates in matching
+        self._hook(msg_helper_cls, "getMessageFilterMatchText", 2, after=self._after_match_text)
+        # 6) re-evaluate the filter verdict when a message is edited
+        self._hook(msg_obj_cls, "checkLayout", 0, before=self._before_check_layout)
+        # 7) toggling filter options refreshes open chats immediately
+        self._hook(ayu_filter_cls, "invalidateFilteredCache", 0, after=self._after_invalidate_cache)
+        # 8) enhancement removed the shadow-ban peer-chain hide; keep that unless restored
+        self._hook(ayu_filter_cls, "isShadowBannedPeerChain", 1, before=self._before_shadow_chain)
+
+    def _hook(self, cls, name, nargs, before=None, after=None):
+        if cls is None:
+            self._hooks_total -= 1
+            log("ERROR: hook %s skipped, class not found (feature degraded)" % name)
+            return False
+        hooked = False
+        try:
+            methods = cls.getDeclaredMethods()
+            for i in range(len(methods)):
+                m = methods[i]
+                try:
+                    if m.getName() != name:
+                        continue
+                    if len(m.getParameterTypes()) != nargs:
+                        continue
+                    m.setAccessible(True)
+                    unhook = self.hook_method(m, XposedHook(before=before, after=after))
+                    if unhook is not None:
+                        self._unhooks.append(unhook)
+                        hooked = True
+                except Exception as e:
+                    log("hook %s candidate failed: %s" % (name, e))
+        except Exception as e:
+            log("hook %s failed: %s" % (name, e))
+        if hooked:
+            self._hooks_ok += 1
+        else:
+            self._hooks_total -= 1
+            log("ERROR: no method hooked for %s/%d (feature degraded)" % (name, nargs))
+        return hooked
+
+    # ------------------------------------------------------------------
+    # small helpers
+    # ------------------------------------------------------------------
+    def _tr(self, key):
+        lang = "zh" if self._is_zh() else "en"
+        return _STRINGS[lang].get(key) or _STRINGS["en"].get(key) or key
+
+    @staticmethod
+    def _is_zh():
+        try:
+            loc = LocaleController.getInstance().getCurrentLocale()
+            return str(loc.getLanguage()).startswith("zh")
+        except Exception:
+            return False
+
+    def _state(self, activity):
+        h = _identity(activity)
+        st = self._states.get(h)
+        if st is None:
+            st = {"activity": activity, "revealed": set(), "pill": None, "views": {}}
+            self._states[h] = st
+        return st
+
+    def _activity_for_adapter(self, adapter):
+        ah = _identity(adapter)
+        cached = self._act_cache.get(ah)
+        if cached is not None:
+            return cached
+        activity = hook_utils.get_private_field(adapter, "this$0")
+        if activity is None:
+            # Fallback: match against activities registered by the createView hook.
+            for st in self._states.values():
+                act = st.get("activity")
+                if act is None:
+                    continue
+                try:
+                    a = act.chatAdapter
+                    if a is not None and a == adapter:
+                        activity = act
+                        break
+                except Exception:
+                    pass
+        if activity is not None:
+            self._act_cache[ah] = activity
+        return activity
+
+    @staticmethod
+    def _adapter_of(activity):
+        if activity is None:
+            return None
+        try:
+            return activity.chatAdapter
+        except Exception:
+            return hook_utils.get_private_field(activity, "chatAdapter")
+
+    @staticmethod
+    def _displayed(adapter, activity):
+        try:
+            if hook_utils.get_private_field(adapter, "isFrozen"):
+                return hook_utils.get_private_field(adapter, "frozenMessages")
+            if hook_utils.get_private_field(adapter, "isFiltered"):
+                return hook_utils.get_private_field(adapter, "filteredMessages")
+            msgs = hook_utils.get_private_field(activity, "messages")
+            if msgs is None:
+                msgs = getattr(activity, "messages", None)
+            return msgs
+        except Exception:
+            return None
+
+    @staticmethod
+    def _row_bounds(adapter):
+        start = hook_utils.get_private_field(adapter, "messagesStartRow")
+        end = hook_utils.get_private_field(adapter, "messagesEndRow")
+        try:
+            start = int(start) if start is not None else 0
+            end = int(end) if end is not None else -1
+        except Exception:
+            start, end = 0, -1
+        return start, end
+
+    def _msg_at(self, msgs, adapter, position):
+        if msgs is None:
+            return None
+        start, end = self._row_bounds(adapter)
+        if position < start or position >= end:
+            return None
+        idx = position - start
+        try:
+            if idx < 0 or idx >= msgs.size():
+                return None
+            return msgs.get(idx)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_hidden_by_owner(msg):
+        try:
+            mo = msg.messageOwner
+            return mo is not None and bool(mo.hide)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _hide_filtered(activity):
+        return bool(hook_utils.get_private_field(activity, "hideFilteredMessages"))
+
+    def _is_regex_hidden(self, activity, msg):
+        """Mirror of the ChatActivity check: should AyuFilter hide this message."""
+        try:
+            if not self._hide_filtered(activity):
+                return False
+            group = activity.getGroup(msg.getGroupId())
+            if group is None:
+                group = activity.getValidGroupedMessage(msg)
+            primary = group.findPrimaryMessageObject() if group is not None else None
+            if primary is None:
+                primary = msg
+            return bool(AyuFilter.shouldHideFilteredMessage(primary, group))
+        except Exception as e:
+            log("is_regex_hidden error: %s" % e)
+            return False
+
+    def _is_collapsed_at(self, activity, adapter, msgs, position):
+        """Mirror of ChatActivity.isCollapsedPlaceholderAt in the Java patch."""
+        if not self.get_setting("placeholder_enabled", True):
+            return False
+        if not self._hide_filtered(activity):
+            return False
+        msg = self._msg_at(msgs, adapter, position)
+        if msg is None or self._is_hidden_by_owner(msg):
+            return False
+        st = self._state(activity)
+        if int(msg.getId()) in st["revealed"]:
+            return False
+        return self._is_regex_hidden(activity, msg)
+
+    def _count_run(self, activity, adapter, msgs, position):
+        count = 0
+        p = position
+        while self._is_collapsed_at(activity, adapter, msgs, p):
+            count += 1
+            p += 1
+        return count
+
+    def _find_position(self, msgs, adapter, msg):
+        try:
+            start, _ = self._row_bounds(adapter)
+            mid = int(msg.getId())
+            for i in range(msgs.size()):
+                m = msgs.get(i)
+                if m is not None and int(m.getId()) == mid:
+                    return start + i
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _post_notify(adapter):
+        try:
+            adapter.notifyDataSetChanged()
+        except Exception as e:
+            log("notifyDataSetChanged failed: %s" % e)
+
+    def _notify_all_adapters(self):
+        for st in list(self._states.values()):
+            adapter = self._adapter_of(st.get("activity"))
+            if adapter is not None:
+                self._post_notify(adapter)
+
+    # ------------------------------------------------------------------
+    # hook 1: getItemViewType — route hidden messages to placeholder/native type
+    # ------------------------------------------------------------------
+    def _after_get_item_view_type(self, param):
+        try:
+            res = param.getResult()
+            if res is None or int(res) != -1000:
+                return
+            if self._placeholder_broken or not self._holder_hook_ok:
+                return  # placeholder creation unavailable: keep upstream hide
+            adapter = param.thisObject
+            activity = self._activity_for_adapter(adapter)
+            if activity is None:
+                return
+            position = int(param.args[0])
+            msgs = self._displayed(adapter, activity)
+            msg = self._msg_at(msgs, adapter, position)
+            if msg is None or self._is_hidden_by_owner(msg):
+                return
+            if not self._hide_filtered(activity):
+                return
+            try:
+                ctype = int(msg.contentType)
+            except Exception:
+                return
+            if ctype == 2:
+                return  # unread divider hidden by upstream's own scan, not by the filter
+            if self._is_ignored_blocked_hidden(activity, msg):
+                return  # upstream's blocked-peer branch precedes the regex branch
+            # Reaching here means upstream's -1000 came from the regex-filter branch,
+            # which is exactly the case the enhancement reroutes. This mirrors the
+            # Java patch without re-running the (expensive) group/filter evaluation.
+            st = self._state(activity)
+            if int(msg.getId()) in st["revealed"]:
+                # Revealed: render as the native content type so the original
+                # content (video / photo / text / ...) is shown faithfully.
+                msg.skipAyuFiltering = True
+                reply = getattr(msg, "replyMessageObject", None)
+                if reply is not None:
+                    reply.skipAyuFiltering = True
+                param.setResult(ctype)
+            elif self.get_setting("placeholder_enabled", True):
+                param.setResult(VIEW_TYPE_FILTER_PLACEHOLDER)
+            # else: keep -1000 (classic hide)
+        except Exception as e:
+            log("getItemViewType hook error: %s" % e)
+
+    @staticmethod
+    def _is_ignored_blocked_hidden(activity, msg):
+        """Mirror of the upstream branch:
+        shouldHideIgnoredBlockedMessages() && isMegagroup(currentChat) && isIgnoredBlockedMessage(msg)."""
+        try:
+            if not AyuFilter.shouldHideIgnoredBlockedMessages():
+                return False
+            chat = getattr(activity, "currentChat", None)
+            if chat is None:
+                chat = hook_utils.get_private_field(activity, "currentChat")
+            if not bool(ChatObject.isMegagroup(chat)):
+                return False
+            return bool(AyuFilter.isIgnoredBlockedMessage(msg))
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # hook 2: onCreateViewHolder — build the placeholder view (FilterHiddenView)
+    # ------------------------------------------------------------------
+    def _before_create_view_holder(self, param):
+        try:
+            args = param.args
+            if len(args) < 2 or int(args[1]) != VIEW_TYPE_FILTER_PLACEHOLDER:
+                return
+            adapter = param.thisObject
+            activity = self._activity_for_adapter(adapter)
+            if activity is None:
+                return
+            context = hook_utils.get_private_field(activity, "mContext")
+            if context is None:
+                context = activity.getParentActivity()
+            if context is None:
+                return
+
+            try:
+                root, hint = self._build_placeholder_view(context)
+            except Exception as e:
+                log("themed placeholder build failed, trying minimal fallback: %s" % e)
+                try:
+                    root, hint = self._build_placeholder_view_minimal(context)
+                except Exception as e2:
+                    # Give up: WITHOUT a result the host adapter returns a bare
+                    # 0-height View, which is exactly the "blank message page"
+                    # failure mode. Flip the flag so getItemViewType stops
+                    # emitting -1001 and degrades to upstream hiding instead.
+                    self._placeholder_broken = True
+                    log("ERROR: placeholder view build failed entirely (%s); "
+                        "degrading to upstream hide behavior" % e2)
+                    return
+
+            st = self._state(activity)
+            vs = {"view": root, "hint": hint, "msg": None, "activity": activity,
+                  "adapter": adapter, "state": st}
+            vh = _identity(root)
+            st["views"][vh] = vs
+            self._views[vh] = vs
+
+            root.setOnClickListener(OnClickListener(self._on_placeholder_click))
+            root.setOnLongClickListener(OnLongClickListener(self._on_placeholder_long_click))
+
+            param.setResult(RecyclerListViewHolder(root))
+        except Exception as e:
+            log("onCreateViewHolder hook error: %s" % e)
+
+    @staticmethod
+    def _build_placeholder_view(context):
+        """FrameLayout + centered hint TextView, visually identical to FilterHiddenView."""
+        root = FrameLayout(context)
+        root.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        hint = TextView(context)
+        hint.setGravity(Gravity.CENTER)
+        hint.setTextSize(float(14))
+        hint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        hint.setMinHeight(dp(44))
+        hint.setPadding(dp(8), dp(12), dp(8), dp(12))
+        root.addView(hint, FrameLayoutParams(-1, -2, Gravity.CENTER))  # MATCH_PARENT, WRAP_CONTENT
+        root.setLayoutParams(RecyclerViewLayoutParams(-1, -2))
+        return root, hint
+
+    @staticmethod
+    def _build_placeholder_view_minimal(context):
+        """Emergency view with hardcoded colors; used only if theme lookups fail."""
+        root = FrameLayout(context)
+        root.setBackgroundColor(0xFFF2F2F2)
+        hint = TextView(context)
+        hint.setGravity(17)  # Gravity.CENTER
+        hint.setTextSize(float(14))
+        hint.setTextColor(0xFF888888)
+        hint.setMinimumHeight(120)
+        root.addView(hint)
+        root.setLayoutParams(RecyclerViewLayoutParams(-1, -2))
+        return root, hint
+
+    # ------------------------------------------------------------------
+    # hook 3: onBindViewHolder — bind merged-run hint or collapse the follower
+    # ------------------------------------------------------------------
+    def _after_bind_view_holder(self, param):
+        try:
+            holder = param.args[0]
+            view = holder.itemView
+            vs = self._views.get(_identity(view))
+            if vs is None or vs.get("view") != view:
+                return
+            adapter = param.thisObject
+            activity = vs.get("activity") or self._activity_for_adapter(adapter)
+            if activity is None:
+                return
+            vs["adapter"] = adapter
+            position = int(param.args[1])
+            msgs = self._displayed(adapter, activity)
+            msg = self._msg_at(msgs, adapter, position)
+            vs["msg"] = msg
+            hint = vs["hint"]
+            if msg is None:
+                hint.setText("")
+                view.setVisibility(View.GONE)
+                return
+            merge = bool(self.get_setting("merge_runs", True))
+            is_collapsed = self._is_collapsed_at(activity, adapter, msgs, position)
+            is_head = is_collapsed and (
+                not merge or not self._is_collapsed_at(activity, adapter, msgs, position - 1))
+            if is_head:
+                run = self._count_run(activity, adapter, msgs, position) if merge else 1
+                if run > 1:
+                    hint.setText(self._tr("merged_hint") % run)
+                else:
+                    hint.setText(self._tr("hint"))
+                view.setVisibility(View.VISIBLE)
+            else:
+                # Follower of a merged run: hide so the run renders as a single bar.
+                hint.setText("")
+                view.setVisibility(View.GONE)
+        except Exception as e:
+            log("onBindViewHolder hook error: %s" % e)
+
+    # ------------------------------------------------------------------
+    # placeholder interactions
+    # ------------------------------------------------------------------
+    def _on_placeholder_click(self, view):
+        """Tap-to-reveal: reveal the whole run of consecutive hidden placeholders."""
+        try:
+            vs = self._views.get(_identity(view))
+            if vs is None:
+                return
+            msg = vs.get("msg")
+            activity = vs.get("activity")
+            adapter = vs.get("adapter")
+            if msg is None or activity is None or adapter is None:
+                return
+            st = vs["state"]
+            if int(msg.getId()) in st["revealed"]:
+                return
+            msgs = self._displayed(adapter, activity)
+            if msgs is None:
+                return
+            position = self._find_position(msgs, adapter, msg)
+            _, end = self._row_bounds(adapter)
+            if position is None:
+                position = 0
+                end = 0
+                st["revealed"].add(int(msg.getId()))
+                msg.skipAyuFiltering = True
+            p = position
+            while p < end and self._is_collapsed_at(activity, adapter, msgs, p):
+                m = self._msg_at(msgs, adapter, p)
+                if m is not None:
+                    st["revealed"].add(int(m.getId()))
+                    m.skipAyuFiltering = True
+                    reply = getattr(m, "replyMessageObject", None)
+                    if reply is not None:
+                        reply.skipAyuFiltering = True
+                p += 1
+            list_view = getattr(activity, "chatListView", None)
+            if list_view is not None:
+                list_view.post(R(lambda: self._post_notify(adapter)))
+            else:
+                self._post_notify(adapter)
+            self._update_pill(st)
+        except Exception as e:
+            log("placeholder click error: %s" % e)
+
+    def _on_placeholder_long_click(self, view):
+        """Long-press: show why the message was hidden (matched text fragments)."""
+        try:
+            vs = self._views.get(_identity(view))
+            if vs is None:
+                return False
+            msg = vs.get("msg")
+            activity = vs.get("activity")
+            if msg is None or activity is None:
+                return False
+            context = activity.getParentActivity()
+            if context is None:
+                return False
+
+            raw = AyuFilter.getMessageText(msg, None)
+            raw = str(raw) if raw is not None else ""
+            ranges = self._matched_ranges(raw, int(msg.getDialogId())) if raw else []
+
+            parts = []
+            if raw:
+                parts.append(self._tr("reason_text"))
+                if ranges:
+                    for s, e in ranges:
+                        s = max(0, s)
+                        e = min(len(raw), e)
+                        if e > s:
+                            parts.append("「%s」" % raw[s:e])
+                else:
+                    parts.append(raw)
+            else:
+                parts.append(self._tr("non_text"))
+
+            (AlertDialogBuilder(context)
+             .set_title(self._tr("reason_title"))
+             .set_message("\n".join(parts).strip())
+             .set_positive_button(get_string("OK"), None)
+             .show())
+            return True
+        except Exception as e:
+            log("placeholder long-click error: %s" % e)
+            return False
+
+    # ------------------------------------------------------------------
+    # hook 4: collapse pill on ChatActivity contentView + destroy cleanup
+    # ------------------------------------------------------------------
+    def _after_create_view(self, param):
+        try:
+            activity = param.thisObject
+            st = self._state(activity)
+            old_pill = st.get("pill")
+            if old_pill is not None:
+                try:
+                    if old_pill.getParent() is not None:
+                        return  # already attached (createView not rebuilt)
+                except Exception:
+                    pass
+                st["pill"] = None  # detached: recreate below
+            content_view = hook_utils.get_private_field(activity, "contentView")
+            context = param.args[0] if len(param.args) else None
+            if content_view is None or context is None:
+                return
+
+            pill = TextView(context)
+            pill.setBackground(Theme.createRoundRectDrawable(
+                dp(18), Theme.getColor(Theme.key_featuredStickers_addButton)))
+            pill.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+            pill.setTextSize(TypedValue.COMPLEX_UNIT_DIP, float(14))
+            pill.setGravity(Gravity.CENTER)
+            try:
+                pill.setTypeface(AndroidUtilities.bold())
+            except Exception:
+                pass
+            pill.setPadding(dp(18), dp(9), dp(18), dp(9))
+            pill.setText(self._tr("collapse"))
+            pill.setVisibility(View.GONE)
+            pill.setClickable(True)
+            pill.setOnClickListener(OnClickListener(lambda v: self._collapse_all(st)))
+            content_view.addView(pill, LayoutHelper.createFrame(
+                -2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0.0, 0.0, 0.0, 64.0))
+            st["pill"] = pill
+        except Exception as e:
+            log("createView hook error: %s" % e)
+
+    def _after_fragment_destroy(self, param):
+        try:
+            activity = param.thisObject
+            h = _identity(activity)
+            st = self._states.pop(h, None)
+            if st is None:
+                return
+            self._remove_pill(st)
+            for vh in list(st.get("views", {}).keys()):
+                self._views.pop(vh, None)
+            for ah, act in list(self._act_cache.items()):
+                if act == activity:
+                    self._act_cache.pop(ah, None)
+        except Exception as e:
+            log("onFragmentDestroy hook error: %s" % e)
+
+    @staticmethod
+    def _remove_pill(st):
+        pill = st.get("pill")
+        st["pill"] = None
+        if pill is None:
+            return
+        try:
+            parent = pill.getParent()
+            if parent is not None:
+                parent.removeView(pill)
+        except Exception:
+            pass
+
+    def _collapse_all(self, st):
+        """Collapse every revealed filtered message back into a placeholder."""
+        try:
+            if not st["revealed"]:
+                return
+            st["revealed"].clear()
+            adapter = self._adapter_of(st.get("activity"))
+            list_view = getattr(st.get("activity"), "chatListView", None)
+            if adapter is not None and list_view is not None:
+                list_view.post(R(lambda: self._post_notify(adapter)))
+            elif adapter is not None:
+                self._post_notify(adapter)
+            self._update_pill(st)
+        except Exception as e:
+            log("collapse_all error: %s" % e)
+
+    def _update_pill(self, st):
+        pill = st.get("pill")
+        if pill is None:
+            return
+        try:
+            show = bool(st["revealed"]) and bool(self.get_setting("collapse_pill", True))
+            pill.setVisibility(View.VISIBLE if show else View.GONE)
+        except Exception:
+            pass
+
+    def _update_all_pills(self):
+        for st in list(self._states.values()):
+            self._update_pill(st)
+
+    # ------------------------------------------------------------------
+    # hook 5: append link-preview (webpage) content to the match text
+    # ------------------------------------------------------------------
+    def _after_match_text(self, param):
+        try:
+            if not self.get_setting("webpage_match", True):
+                return
+            result = param.getResult()
+            msg = param.args[0] if len(param.args) else None
+            if msg is None or result is None:
+                return
+            mo = msg.messageOwner
+            if mo is None:
+                return
+            media = mo.media
+            if media is None:
+                return
+            cls_name = media.getClass().getName()
+            if not str(cls_name).endswith("TLRPC$TL_messageMediaWebPage"):
+                return
+            web_page = media.webpage
+            if web_page is None:
+                return
+            parts = []
+            for attr in ("url", "display_url", "site_name", "title", "description"):
+                try:
+                    v = getattr(web_page, attr, None)
+                    if v:
+                        parts.append(str(v))
+                except Exception:
+                    pass
+            if not parts:
+                return
+            text = str(result)
+            block = "\n" + "\n".join(parts)
+            # Insert before ayuGram's trailing <type>N</type> artifact, exactly like
+            # the Java patch's placement inside getMessageFilterMatchText.
+            idx = text.rfind("\n<type>")
+            if idx >= 0:
+                text = text[:idx] + block + text[idx:]
+            else:
+                text = text + block
+            param.setResult(text)
+        except Exception as e:
+            log("match-text hook error: %s" % e)
+
+    # ------------------------------------------------------------------
+    # hook 6: re-evaluate the filter verdict when a message is edited
+    # ------------------------------------------------------------------
+    def _before_check_layout(self, param):
+        try:
+            msg = param.thisObject
+            mo = msg.messageOwner
+            src = str(mo.message) if mo is not None and mo.message is not None else None
+            key = (int(msg.getDialogId()), int(msg.getId()))
+            last = self._eval_src.get(key, False)  # False == never evaluated
+            if last is not False and last == src:
+                return
+            # Content changed since the last evaluation (an edit) or first pass:
+            # the global isFiltered cache is keyed by message id, NOT content, so
+            # invalidate the per-message (and per-group) entry to force a fresh verdict.
+            self._eval_src[key] = src
+            if len(self._eval_src) > 8000:
+                self._eval_src.clear()
+            if last is False:
+                return  # first evaluation: nothing stale yet
+            self._invalidate_message_cache(msg)
+        except Exception as e:
+            log("checkLayout hook error: %s" % e)
+
+    @staticmethod
+    def _invalidate_message_cache(msg):
+        try:
+            cache_cls = hook_utils.find_class("tw.nekomimi.nekogram.filters.AyuFilterCache")
+            if cache_cls is None:
+                return
+            dialog_id = int(msg.getDialogId())
+            msg_id = int(msg.getId())
+            methods = cache_cls.getDeclaredMethods()
+            for i in range(len(methods)):
+                m = methods[i]
+                try:
+                    name = m.getName()
+                    if name == "invalidate" and len(m.getParameterTypes()) == 2:
+                        m.setAccessible(True)
+                        # Method.invoke(Object...) boxes via Chaquopy defaults
+                        # (int -> Long); pass explicit boxes per the target types.
+                        m.invoke(None, dialog_id, msg_id)
+                    elif name == "invalidateGroup" and len(m.getParameterTypes()) == 2:
+                        group_id = int(msg.getGroupId())
+                        if group_id != 0:
+                            m.setAccessible(True)
+                            m.invoke(None, dialog_id, group_id)
+                except Exception:
+                    pass
+        except Exception as e:
+            log("invalidate_message_cache error: %s" % e)
+
+    # ------------------------------------------------------------------
+    # hook 7: toggling a filter option refreshes open chats immediately
+    # ------------------------------------------------------------------
+    def _after_invalidate_cache(self, param):
+        try:
+            if self._refresh_pending:
+                return  # coalesce bursts of invalidations into one UI refresh
+            self._refresh_pending = True
+
+            def post():
+                self._refresh_pending = False
+                try:
+                    (NotificationCenter.getInstance(UserConfig.selectedAccount)
+                     .postNotificationName(NotificationCenter.regexFiltersUpdated))
+                except Exception as e:
+                    log("post regexFiltersUpdated failed: %s" % e)
+
+            run_on_ui_thread(post, 120)
+        except Exception as e:
+            log("invalidate-cache hook error: %s" % e)
+
+    # ------------------------------------------------------------------
+    # hook 8: shadow-ban peer chain (removed by the enhancement; restorable)
+    # ------------------------------------------------------------------
+    def _before_shadow_chain(self, param):
+        try:
+            if self.get_setting("shadow_chain_upstream", False):
+                return  # user opted back into upstream behavior
+            param.setResult(False)
+        except Exception as e:
+            log("shadow-chain hook error: %s" % e)
+
+    # ------------------------------------------------------------------
+    # matched-range computation (mirror of AyuFilter.getMatchedRanges)
+    # ------------------------------------------------------------------
+    def _matched_ranges(self, text, dialog_id):
+        out = []
+        if not text:
+            return out
+        raw = []
+        # chat-specific filters
+        try:
+            chat_filters = AyuFilter.getChatFiltersForDialog(dialog_id)
+            if chat_filters is not None:
+                for i in range(chat_filters.size()):
+                    self._collect_filter_ranges(chat_filters.get(i), text, raw)
+        except Exception as e:
+            log("chat filters scan error: %s" % e)
+        # shared filters (honoring per-dialog exclusions and the chats toggle)
+        try:
+            allow = True
+            if dialog_id > 0:
+                allow = bool(NaConfig.INSTANCE.getRegexFiltersEnableInChats().Bool())
+            if allow:
+                excluded = AyuFilter.getExcludedSharedFilterIds(dialog_id)
+                shared = AyuFilter.getRegexFilters()
+                if shared is not None:
+                    for i in range(shared.size()):
+                        f = shared.get(i)
+                        try:
+                            fid = getattr(f, "id", None)
+                            if fid and excluded is not None and excluded.contains(fid):
+                                continue
+                        except Exception:
+                            pass
+                        self._collect_filter_ranges(f, text, raw)
+        except Exception as e:
+            log("shared filters scan error: %s" % e)
+        # merge overlapping ranges
+        raw.sort(key=lambda r: r[0])
+        for s, e in raw:
+            if out and s <= out[-1][1]:
+                if e > out[-1][1]:
+                    out[-1] = (out[-1][0], e)
+            else:
+                out.append((s, e))
+        return out
+
+    def _collect_filter_ranges(self, f, text, raw):
+        try:
+            if f is None or not bool(f.enabled) or bool(f.reversed) or f.pattern is None:
+                return
+            src = str(f.pattern.pattern())
+            if not src:
+                return
+            flags = re.IGNORECASE if bool(f.caseInsensitive) else 0
+            key = (src, flags)
+            rx = self._regex_cache.get(key)
+            if rx is None:
+                rx = re.compile(src, flags)
+                if len(self._regex_cache) > 256:
+                    self._regex_cache.clear()
+                self._regex_cache[key] = rx
+            n = len(text)
+            for m in rx.finditer(text):
+                s, e = m.start(), m.end()
+                if 0 <= s < e <= n:
+                    raw.append((s, e))
+        except Exception:
+            pass
