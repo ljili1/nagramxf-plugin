@@ -4,7 +4,7 @@
 移植为 `Keeperorowner/NagramXF` 的 Python 插件（exteraGram 式插件 SDK）。
 
 - 插件文件：`filter_enhancement.py`（单文件，无外部依赖）
-- 插件 ID：`filter_enhancement`，版本 1.0.3
+- 插件 ID：`filter_enhancement`，版本 1.0.4
 - 目标宿主：Keeperorowner/NagramXF **plugin 构建**（dev 分支，`min_version = 12.2.10`）
 
 ## 一、功能对照
@@ -13,8 +13,8 @@
 |---|---|---|---|
 | 1 | 被过滤消息显示为可点击占位条（视图类型 -1001，替代直接消失） | 一致 | `ChatActivity$ChatActivityAdapter.getItemViewType` / `onCreateViewHolder` |
 | 2 | 连续占位条合并为「N 条消息被隐藏」单条 | 一致（可选关闭） | `onBindViewHolder` |
-| 3 | 点击占位条恢复显示整段消息（原内容原样渲染） | 一致 | 占位条自带 `OnClickListener` |
-| 4 | 长按占位条弹出「过滤原因」（命中片段） | 一致 | 占位条自带 `OnLongClickListener` |
+| 3 | 点击占位条恢复显示整段消息（原内容原样渲染） | 一致 | `ChatActivity.createMenu`（6 参，主路径） |
+| 4 | 长按占位条弹出「过滤原因」（命中片段） | 一致 | `ChatActivity.createMenu`（6 参，主路径） |
 | 5 | 「收起」悬浮按钮，一键重新隐藏全部已恢复消息 | 一致（可选关闭） | `ChatActivity.createView` |
 | 6 | 链接预览（URL/站点名/标题/简介）参与正则匹配 | 一致（可选关闭） | `MessageHelper.getMessageFilterMatchText` |
 | 7 | 编辑消息后立即重新判定过滤结果（按内容失效缓存） | 一致 | `MessageObject.checkLayout` + `AyuFilterCache.invalidate/invalidateGroup`（反射） |
@@ -75,11 +75,46 @@ normal 构建中 `PluginsController` 为空壳，无插件功能）。
 
 ## 六、故障排查
 
-- **插件设置页内置「钩子状态」行**（9 个钩子应全部安装成功）。若有缺失，该行会红色标注
+- **插件设置页内置「钩子状态」行**（10 个钩子应全部安装成功）。若有缺失，该行会红色标注
   实际数量；缺失时对应功能自动降级为上游原生行为，请截图该行并反馈宿主版本号。
+- **「交互诊断」行**：显示 `createMenu` 钩子 / 列表监听器钩子的安装状态与点击、长按命中次数。
+  点击占位条后命中次数不增加，说明触摸未派发到拦截点（宿主分派路径不同），
+  请连同该行截图与日志一并反馈。
 - 插件日志经宿主 `AppUtils.log` 输出，前缀 `[filter_enhancement]`；可用日志工具检索。
 
 ### 已修复的历史问题
+
+**v1.0.4 — 交互拦截改挂在 `createMenu` 汇聚点（点击/长按仍无效的根因收敛）**
+
+v1.0.3 把拦截挂在 `ChatActivity` 的两个匿名监听器实例上，存在两处结构性弱点：
+
+1. **安装点被早退/异常吞掉。** `_install_listener_hooks` 原本写在
+   `_after_create_view` 的「收起」悬浮按钮创建之后，而该方法在此之前有多个
+   `return`（按钮已挂载、`contentView`/`context` 取不到），并且整段包在同一个
+   `try/except` 内——按钮构建任一环节抛异常，安装调用就会被整体跳过。结果是
+   **占位条照常显示、点击与长按同时静默失效**，与上报症状完全吻合。
+2. **依赖匿名类的字段名。** `onItemClickListener` / `onItemLongClickListener`
+   是包级私有字段，宿主版本若改为内联 lambda 或改名，反射返回 `None`，
+   同样只影响交互、不影响占位条。
+
+修复（分层，逐级降级）：
+
+- **主路径**：钩 `ChatActivity.createMenu(View, boolean, boolean, float, float, boolean)`
+  ——两种手势的汇聚点。RecyclerListView 的触摸派发最终都会走到它：
+  点击 -> `createMenu(view, true, false, x, y, false)`；
+  长按 -> `createMenu(view, false, true, x, y, true)`。
+  它是 `ChatActivity` 自有私有方法（非匿名类成员），**插件加载时即可安装**，
+  不需要 `ChatActivity` 实例。同类插件 `filter-sentinel` 亦采用该拦截点。
+  另挂 7 参重载（长按标志后移一位）作为可选加固，不计入健康分。
+- **次级路径**：v1.0.3 的匿名监听器钩子保留，但从 pill 块中解耦、提到
+  `_after_create_view` 最先执行；宿主无对应字段时置位 `_listener_hooks_dead`，
+  避免每次开聊天重复反射。
+- **兜底路径**：占位条自身 `OnClickListener` / `OnLongClickListener` 仍保留。
+- `createMenu` 钩子对非占位条视图直接放行，宿主原有长按菜单不受影响。
+
+新增设置页「交互诊断」行：显示 `createMenu` 钩子与监听器钩子的安装状态、
+点击/长按命中次数。若点击后命中次数不增加，即说明触摸未派发到上述任一拦截点，
+可据此直接定位宿主差异。
 
 **v1.0.3 —「点击显示无效、长按不显示命中规则」（第二轮用户日志确诊）**
 

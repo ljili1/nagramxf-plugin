@@ -15,14 +15,17 @@
     python test_filter_enhancement.py
 """
 import ast
+import importlib.machinery
+import importlib.util
 import os
 import re
 import sys
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_PATH = os.path.join(HERE, "filter_enhancement.plugin")
 VERSIONS_DIR = os.path.join(HERE, "versions")
-ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3"]
+ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4"]
 
 PASSED = [0]
 FAILED = [0]
@@ -101,7 +104,7 @@ def arg_kind(arg):
 
 
 def test_latest():
-    print("== 主版本（filter_enhancement.plugin，应为 v1.0.3）==")
+    print("== 主版本（filter_enhancement.plugin，应为 v1.0.4）==")
     src, tree = parse(PLUGIN_PATH)
 
     compile(src, PLUGIN_PATH, "exec")
@@ -112,7 +115,7 @@ def test_latest():
     check("__id__ 符合宿主格式",
           bool(re.match(r"^[a-zA-Z][a-zA-Z0-9_-]{1,31}$", meta.get("__id__", ""))))
     check("__name__ 非空", bool(meta.get("__name__")))
-    check("__version__ = 1.0.3", meta.get("__version__") == "1.0.3")
+    check("__version__ = 1.0.4", meta.get("__version__") == "1.0.4")
     check("__min_version__ >= 12.2.10",
           meta.get("__min_version__", "0") >= "12.2.10")
 
@@ -217,10 +220,298 @@ def test_v103_listener_hooks():
           "param.setResult(JBoolean(True))" in src)
 
 
+# ---------------------------------------------------------------------------
+# v1.0.4 —— Java 替身驱动的行为级测试
+#
+# v1.0.3 的教训：交互拦截若挂在「反射 ChatActivity 匿名监听器实例」上，
+# 一旦宿主字段名变化或安装点被前面的早退/异常跳过，点击与长按会同时静默失效。
+# v1.0.4 改为主钩 ChatActivity.createMenu（两种手势的汇聚点），本段用替身
+# 直接驱动分派函数，验证命中/未命中、事件消费与重载参数解析。
+# ---------------------------------------------------------------------------
+class _JStub:
+    """Any Java class / instance / static member, permissively stubbed."""
+
+    def __init__(self, name="stub"):
+        object.__setattr__(self, "_name", name)
+
+    def __getattr__(self, item):
+        return _JStub("%s.%s" % (object.__getattribute__(self, "_name"), item))
+
+    def __call__(self, *args, **kwargs):
+        return _JStub("%s()" % object.__getattribute__(self, "_name"))
+
+    def __int__(self):
+        return 0
+
+    def __index__(self):
+        return 0
+
+    def __bool__(self):
+        return True
+
+    def __str__(self):
+        return object.__getattribute__(self, "_name")
+
+
+class _JBox:
+    """java.lang.Integer / Boolean / Long stand-in (setResult 装箱回归防护)."""
+
+    def __init__(self, value=True):
+        self.value = value
+
+    def __int__(self):
+        return int(self.value)
+
+    def __bool__(self):
+        return bool(self.value)
+
+    def __eq__(self, other):
+        return isinstance(other, _JBox) and self.value == other.value
+
+    def __repr__(self):
+        return "_JBox(%r)" % (self.value,)
+
+
+class _FakeView:
+    """Identity-comparable stand-in for an android.view.View."""
+
+
+def _build_stub_modules():
+    """Minimal host SDK stand-ins so the plugin module can be imported on CPython."""
+    java = types.ModuleType("java")
+
+    def jclass(name):
+        if name == "java.lang.System":
+            stub = _JStub("System")
+            stub.identityHashCode = lambda obj: id(obj)  # real identity, not 0
+            return stub
+        if name in ("java.lang.Integer", "java.lang.Boolean", "java.lang.Long"):
+            return _JBox
+        return _JStub(name)
+
+    java.jclass = jclass
+
+    base_plugin = types.ModuleType("base_plugin")
+
+    class BasePlugin:
+        def __init__(self):
+            self.id = "filter_enhancement"
+
+        def hook_method(self, *a, **k):
+            return object()
+
+        def unhook_method(self, *a, **k):
+            pass
+
+        def get_setting(self, key, default=None):
+            return default
+
+        def log(self, message):
+            pass
+
+    class XposedHook:
+        def __init__(self, before=None, after=None):
+            self.before = before
+            self.after = after
+
+    base_plugin.BasePlugin = BasePlugin
+    base_plugin.XposedHook = XposedHook
+
+    hook_utils = types.ModuleType("hook_utils")
+    hook_utils.find_class = lambda name: None
+    hook_utils.get_private_field = lambda obj, name: None
+
+    android_utils = types.ModuleType("android_utils")
+    android_utils.dp = lambda value: int(value)
+    android_utils.log = lambda data: None
+    android_utils.run_on_ui_thread = lambda func, delay=0: None
+    android_utils.get_string = lambda key: "OK"
+    android_utils.OnClickListener = lambda func: func
+    android_utils.OnLongClickListener = lambda func: func
+    android_utils.R = lambda func: func
+
+    ui = types.ModuleType("ui")
+    ui_settings = types.ModuleType("ui.settings")
+    for cls_name in ("Header", "Divider", "Switch", "Text"):
+        ui_settings.__dict__[cls_name] = type(cls_name, (object,), {
+            "__init__": lambda self, **kw: self.__dict__.update(kw)})
+    ui_alert = types.ModuleType("ui.alert")
+    ui_alert.AlertDialogBuilder = _JStub("AlertDialogBuilder")
+    ui.settings = ui_settings
+    ui.alert = ui_alert
+
+    return {
+        "java": java,
+        "base_plugin": base_plugin,
+        "hook_utils": hook_utils,
+        "android_utils": android_utils,
+        "ui": ui,
+        "ui.settings": ui_settings,
+        "ui.alert": ui_alert,
+    }
+
+
+def load_plugin_module():
+    for name, mod in _build_stub_modules().items():
+        sys.modules[name] = mod
+    loader = importlib.machinery.SourceFileLoader("fe_under_test", PLUGIN_PATH)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class _FakeParam:
+    def __init__(self, args):
+        self.args = list(args)
+        self.result_set = False
+        self.result = None
+
+    def setResult(self, value):
+        self.result_set = True
+        self.result = value
+
+    def getResult(self):
+        return self.result
+
+
+def _fresh_plugin(module):
+    plugin = module.FilterEnhancementPlugin()
+    plugin._views = {}
+    plugin._states = {}
+    plugin._diag = {"taps": 0, "longs": 0, "menu_miss": 0}
+    plugin._listener_hooks_done = False
+    plugin._listener_hooks_dead = False
+    plugin._hooks_total = 10
+    plugin.log = lambda message: None
+    plugin.dispatched = []
+    plugin._reveal_from = lambda vs: plugin.dispatched.append(("reveal", vs["tag"]))
+    plugin._on_placeholder_long_click = lambda view: plugin.dispatched.append(("long", view))
+    return plugin
+
+
+def _register_placeholder(module, plugin, tag="p1"):
+    view = _FakeView()
+    vs = {"view": view, "msg": None, "activity": None, "adapter": None, "state": {}, "tag": tag}
+    plugin._views[module._identity(view)] = vs
+    return view, vs
+
+
+def test_v104_create_menu_dispatch():
+    print("== v1.0.4 createMenu 分派（行为级，Java 替身）==")
+    module = load_plugin_module()
+    plugin = _fresh_plugin(module)
+    plugin._menu_hook_ok = True
+    root, _vs = _register_placeholder(module, plugin)
+
+    # 1) 6 参重载：点击（longpress = args[5] = False）
+    param = _FakeParam([root, True, False, 0.0, 0.0, False])
+    plugin._before_create_menu(param)
+    check("点击命中 → 触发 reveal", plugin.dispatched[-1] == ("reveal", "p1"))
+    check("点击命中 → 消费事件（setResult 装箱布尔）",
+          param.result_set and bool(param.getResult()))
+    check("点击命中 → taps 计数", plugin._diag["taps"] == 1)
+
+    # 2) 6 参重载：长按（longpress = args[5] = True）
+    param = _FakeParam([root, False, True, 0.0, 0.0, True])
+    plugin._before_create_menu(param)
+    check("长按命中 → 触发原因弹窗", plugin.dispatched[-1] == ("long", root))
+    check("长按命中 → 消费事件", param.result_set)
+    check("长按命中 → longs 计数", plugin._diag["longs"] == 1)
+
+    # 3) 7 参重载：longpress 后移一位（args[6]）
+    param = _FakeParam([root, True, False, 0.0, 0.0, True, True])
+    plugin._before_create_menu(param)
+    check("7 参重载 → 长按解析到 args[6]", plugin.dispatched[-1] == ("long", root))
+    param = _FakeParam([root, True, False, 0.0, 0.0, True, False])
+    plugin._before_create_menu(param)
+    check("7 参重载 → 点击解析到 args[6]", plugin.dispatched[-1] == ("reveal", "p1"))
+
+    # 4) 非占位条视图：不得消费，宿主菜单必须保持原样
+    other = _FakeView()
+    miss_before = plugin._diag["menu_miss"]
+    param = _FakeParam([other, True, False, 0.0, 0.0, False])
+    plugin._before_create_menu(param)
+    check("非占位条 → 不消费（宿主菜单不受影响）", not param.result_set)
+    check("非占位条 → menu_miss 计数", plugin._diag["menu_miss"] == miss_before + 1)
+
+    # 5) 参数解析表
+    mv = module.FilterEnhancementPlugin._menu_longpress
+    check("_menu_longpress 6 参取 args[5]",
+          mv([0, 0, 0, 0, 0, True]) is True and mv([0, 0, 0, 0, 0, False]) is False)
+    check("_menu_longpress 7/9 参取 args[6]",
+          mv([0, 0, 0, 0, 0, True, True]) is True
+          and mv([0, 0, 0, 0, 0, True, True, False, False]) is True)
+
+    # 6) 次级路径（匿名监听器）仍可用且计数
+    taps_before = plugin._diag["taps"]
+    param = _FakeParam([root])
+    plugin._before_list_item_click(param)
+    check("次级点击路径消费 + 计数",
+          param.result_set and plugin._diag["taps"] == taps_before + 1)
+    longs_before = plugin._diag["longs"]
+    param = _FakeParam([root])
+    plugin._before_list_item_long_click(param)
+    check("次级长按路径消费 + 计数",
+          param.result_set and plugin._diag["longs"] == longs_before + 1)
+
+    # 7) 宿主无匿名监听器字段时不得反复反射
+    plugin._listener_hooks_dead = True
+    attempts = []
+    plugin.hook_method = lambda *a, **k: attempts.append(1)
+    plugin._install_listener_hooks(object())
+    check("_listener_hooks_dead 后短路（不重复反射安装）", not attempts)
+
+
+def test_v104_wiring():
+    print("== v1.0.4 接线与版本演化 ==")
+    src, tree = parse(PLUGIN_PATH)
+    method_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    check("含 _before_create_menu（主路径）", "_before_create_menu" in method_names)
+    check("含 _menu_longpress（重载参数解析）", "_menu_longpress" in method_names)
+    check("含 _hook_optional（可选钩子，不计入健康分）", "_hook_optional" in method_names)
+
+    # createMenu 6 参必须用计入健康分的 _hook 声明
+    main_hook = False
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_hook" and len(node.args) >= 3
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value == "createMenu"
+                and isinstance(node.args[2], ast.Constant) and node.args[2].value == 6):
+            main_hook = True
+    check("createMenu 6 参为主钩（计入 10 个钩子）", main_hook)
+
+    # 关键回归：_install_listener_hooks 必须位于 _after_create_view 的 pill 块之前，
+    # 即排在函数内任何 return 之前——v1.0.3 把它放在 pill 创建之后，被早退/异常跳过。
+    create_view_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_after_create_view":
+            create_view_fn = node
+    check("定位 _after_create_view", create_view_fn is not None)
+    if create_view_fn is not None:
+        install_lines = [n.lineno for n in ast.walk(create_view_fn)
+                         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                         and n.func.attr == "_install_listener_hooks"]
+        return_lines = [n.lineno for n in ast.walk(create_view_fn) if isinstance(n, ast.Return)]
+        check("_install_listener_hooks 已与 pill 块解耦（早于所有 return）",
+              bool(install_lines) and bool(return_lines)
+              and min(install_lines) < min(return_lines))
+        check("_after_create_view 中已无重复安装调用", len(install_lines) == 1)
+
+    # 版本演化：v1.0.3 不得含 createMenu 主路径（历史保真），v1.0.4 必须含
+    v103 = os.path.join(VERSIONS_DIR, "v1.0.3", "filter_enhancement.plugin")
+    if os.path.isfile(v103):
+        src103, _ = parse(v103)
+        check("v1.0.3 不含 createMenu 主路径（历史保真）", "_before_create_menu" not in src103)
+    check("v1.0.4 含 createMenu 主路径", "_before_create_menu" in src)
+
+
 def main():
     test_latest()
     test_all_versions()
     test_v103_listener_hooks()
+    test_v104_create_menu_dispatch()
+    test_v104_wiring()
     print("\n通过 %d 项，失败 %d 项。" % (PASSED[0], FAILED[0]))
     return 1 if FAILED[0] else 0
 
