@@ -4,7 +4,7 @@
 移植为 `Keeperorowner/NagramXF` 的 Python 插件（exteraGram 式插件 SDK）。
 
 - 插件文件：`filter_enhancement.py`（单文件，无外部依赖）
-- 插件 ID：`filter_enhancement`，版本 1.0.2
+- 插件 ID：`filter_enhancement`，版本 1.0.3
 - 目标宿主：Keeperorowner/NagramXF **plugin 构建**（dev 分支，`min_version = 12.2.10`）
 
 ## 一、功能对照
@@ -81,7 +81,21 @@ normal 构建中 `PluginsController` 为空壳，无插件功能）。
 
 ### 已修复的历史问题
 
-**v1.0.2 —「有过滤的会话打开后消息页空白/闪屏」（用户日志确诊）**
+**v1.0.3 —「点击显示无效、长按不显示命中规则」（第二轮用户日志确诊）**
+
+根因：Telegram 的 `RecyclerListView` 会拦截条目触摸并**自行派发**
+`onItemClick` / `onItemLongClick`，子视图自带的 `OnClickListener` /
+`OnLongClickListener` 永远收不到事件（这正是原 Java 补丁演化史中
+`fix(filters): route tap-to-reveal through RecyclerListView.onItemClick`
+这条提交的由来，v1.0.2 之前的插件未参考到该经验）。日志表现：钩子 9/9
+安装、零异常、零点击日志——监听器从未被触发。
+修复：在 `ChatActivity.createView` 时读取 `onItemClickListener` /
+`onItemLongClickListener`（包级私有字段，匿名内部类，全进程单一 Class），
+钩住其 `onItemClick(View,int,float,float)`：点击→恢复整段并消费事件；
+长按→弹出命中原因并消费事件。占位条自身的监听器保留为兜底。事件在
+首次打开聊天时懒安装（需要 ChatActivity 实例定位匿名类）。
+
+**v1.0.2 —「有过滤的会话打开后消息页空白/闪屏」（用户日志确诊，8162 次同类异常）**
 
 根因：`getItemViewType` 返回类型为 `int`，插件在钩子中 `setResult(-1001)` 时，Chaquopy
 对 Object 形参下的 Python `int` 默认装箱为 `java.lang.Long`，而 Xposed 框架交还结果时

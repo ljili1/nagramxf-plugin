@@ -29,7 +29,7 @@ below (zh-CN + en) because plugins cannot register R.string resources.
 
 __id__ = "filter_enhancement"
 __name__ = "Filter Enhancement"
-__version__ = "1.0.3"
+__version__ = "1.0.2"
 __author__ = "ljili1"
 __description__ = (
     "Regex filter enhancement: tappable placeholders for hidden messages, merged "
@@ -169,10 +169,6 @@ class FilterEnhancementPlugin(BasePlugin):
         self._holder_hook_ok = False
         self._placeholder_broken = False
         self._refresh_pending = False
-        # RecyclerListView click dispatch hooks (installed lazily on first chat open)
-        self._listener_hooks_done = False
-        self._click_hook_ok = False
-        self._longclick_hook_ok = False
         self._install_hooks()
         log("hooks installed: %d/%d" % (self._hooks_ok, self._hooks_total))
 
@@ -648,36 +644,29 @@ class FilterEnhancementPlugin(BasePlugin):
     # placeholder interactions
     # ------------------------------------------------------------------
     def _on_placeholder_click(self, view):
-        """Backup entry: the placeholder view's own OnClickListener. In practice this
-        never fires because RecyclerListView intercepts touches and dispatches
-        onItemClick itself (see _install_listener_hooks); kept for robustness."""
+        """Tap-to-reveal: reveal the whole run of consecutive hidden placeholders."""
         try:
             vs = self._views.get(_identity(view))
             if vs is None:
                 return
-            self._reveal_from(vs)
-        except Exception as e:
-            log("placeholder click error: %s" % e)
-
-    def _reveal_from(self, vs):
-        """Tap-to-reveal: reveal the whole run of consecutive hidden placeholders."""
-        msg = vs.get("msg")
-        activity = vs.get("activity")
-        adapter = vs.get("adapter")
-        if msg is None or activity is None or adapter is None:
-            return
-        st = vs["state"]
-        if int(msg.getId()) in st["revealed"]:
-            return
-        msgs = self._displayed(adapter, activity)
-        if msgs is None:
-            return
-        position = self._find_position(msgs, adapter, msg)
-        _, end = self._row_bounds(adapter)
-        if position is None:
-            st["revealed"].add(int(msg.getId()))
-            msg.skipAyuFiltering = True
-        else:
+            msg = vs.get("msg")
+            activity = vs.get("activity")
+            adapter = vs.get("adapter")
+            if msg is None or activity is None or adapter is None:
+                return
+            st = vs["state"]
+            if int(msg.getId()) in st["revealed"]:
+                return
+            msgs = self._displayed(adapter, activity)
+            if msgs is None:
+                return
+            position = self._find_position(msgs, adapter, msg)
+            _, end = self._row_bounds(adapter)
+            if position is None:
+                position = 0
+                end = 0
+                st["revealed"].add(int(msg.getId()))
+                msg.skipAyuFiltering = True
             p = position
             while p < end and self._is_collapsed_at(activity, adapter, msgs, p):
                 m = self._msg_at(msgs, adapter, p)
@@ -688,103 +677,19 @@ class FilterEnhancementPlugin(BasePlugin):
                     if reply is not None:
                         reply.skipAyuFiltering = True
                 p += 1
-        list_view = getattr(activity, "chatListView", None)
-        if list_view is not None:
-            list_view.post(R(lambda: self._post_notify(adapter)))
-        else:
-            self._post_notify(adapter)
-        self._update_pill(st)
-
-    # ------------------------------------------------------------------
-    # RecyclerListView click dispatch (primary interaction path)
-    # ------------------------------------------------------------------
-    def _install_listener_hooks(self, activity):
-        """Telegram's RecyclerListView intercepts item touches and dispatches
-        onItemClick/onItemLongClick itself; a child view's own OnClickListener never
-        fires (this is why the original Java patch routed tap-to-reveal through
-        RecyclerListView.onItemClick). Hook the anonymous listener classes instead:
-        they are instance fields of ChatActivity, one Class per process, so a single
-        install covers every chat."""
-        if self._listener_hooks_done:
-            return
-        try:
-            click_listener = hook_utils.get_private_field(activity, "onItemClickListener")
-            long_listener = hook_utils.get_private_field(activity, "onItemLongClickListener")
-            if click_listener is not None:
-                cls = click_listener.getClass()
-                for m in cls.getDeclaredMethods():
-                    try:
-                        if m.getName() != "onItemClick" or len(m.getParameterTypes()) != 4:
-                            continue
-                        m.setAccessible(True)
-                        unhook = self.hook_method(m, XposedHook(before=self._before_list_item_click))
-                        if unhook is not None:
-                            self._unhooks.append(unhook)
-                            self._click_hook_ok = True
-                    except Exception:
-                        pass
-            if long_listener is not None:
-                cls2 = long_listener.getClass()
-                for m in cls2.getDeclaredMethods():
-                    try:
-                        if m.getName() != "onItemClick" or len(m.getParameterTypes()) != 4:
-                            continue
-                        m.setAccessible(True)
-                        unhook = self.hook_method(m, XposedHook(before=self._before_list_item_long_click))
-                        if unhook is not None:
-                            self._unhooks.append(unhook)
-                            self._longclick_hook_ok = True
-                    except Exception:
-                        pass
-            self._listener_hooks_done = self._click_hook_ok and self._longclick_hook_ok
-            log("listener hooks: click=%s long=%s" % (self._click_hook_ok, self._longclick_hook_ok))
+            list_view = getattr(activity, "chatListView", None)
+            if list_view is not None:
+                list_view.post(R(lambda: self._post_notify(adapter)))
+            else:
+                self._post_notify(adapter)
+            self._update_pill(st)
         except Exception as e:
-            log("listener hook install failed: %s" % e)
-
-    def _placeholder_for_view(self, view):
-        """Walk up from the touched view (RecyclerListView may pass an inner child)
-        until a registered placeholder root is found."""
-        v = view
-        for _ in range(6):
-            if v is None:
-                return None
-            vs = self._views.get(_identity(v))
-            if vs is not None and vs.get("view") == v:
-                return vs
-            try:
-                v = v.getParent()
-            except Exception:
-                return None
-        return None
-
-    def _before_list_item_click(self, param):
-        try:
-            view = param.args[0] if len(param.args) > 0 else None
-            vs = self._placeholder_for_view(view)
-            if vs is None:
-                return  # not ours: let the original listener run
-            self._reveal_from(vs)
-            param.setResult(None)  # consume: skip the original onItemClick
-        except Exception as e:
-            log("list item click hook error: %s" % e)
-
-    def _before_list_item_long_click(self, param):
-        try:
-            view = param.args[0] if len(param.args) > 0 else None
-            vs = self._placeholder_for_view(view)
-            if vs is None:
-                return
-            self._on_placeholder_long_click(vs["view"])
-            param.setResult(JBoolean(True))  # consume: suppress the original long-press
-        except Exception as e:
-            log("list item long-click hook error: %s" % e)
+            log("placeholder click error: %s" % e)
 
     def _on_placeholder_long_click(self, view):
-        """Long-press: show why the message was hidden (matched text fragments).
-        Accepts the placeholder root OR any inner child (the list may dispatch the
-        touched descendant); resolution goes through _placeholder_for_view."""
+        """Long-press: show why the message was hidden (matched text fragments)."""
         try:
-            vs = self._placeholder_for_view(view)
+            vs = self._views.get(_identity(view))
             if vs is None:
                 return False
             msg = vs.get("msg")
@@ -861,9 +766,6 @@ class FilterEnhancementPlugin(BasePlugin):
             content_view.addView(pill, LayoutHelper.createFrame(
                 -2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0.0, 0.0, 0.0, 64.0))
             st["pill"] = pill
-
-            # Primary interaction path: hook the list's own click dispatch.
-            self._install_listener_hooks(activity)
         except Exception as e:
             log("createView hook error: %s" % e)
 

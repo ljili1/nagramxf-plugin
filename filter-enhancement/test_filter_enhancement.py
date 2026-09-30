@@ -22,7 +22,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_PATH = os.path.join(HERE, "filter_enhancement.plugin")
 VERSIONS_DIR = os.path.join(HERE, "versions")
-ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2"]
+ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3"]
 
 PASSED = [0]
 FAILED = [0]
@@ -101,7 +101,7 @@ def arg_kind(arg):
 
 
 def test_latest():
-    print("== 主版本（filter_enhancement.plugin，应为 v1.0.2）==")
+    print("== 主版本（filter_enhancement.plugin，应为 v1.0.3）==")
     src, tree = parse(PLUGIN_PATH)
 
     compile(src, PLUGIN_PATH, "exec")
@@ -112,7 +112,7 @@ def test_latest():
     check("__id__ 符合宿主格式",
           bool(re.match(r"^[a-zA-Z][a-zA-Z0-9_-]{1,31}$", meta.get("__id__", ""))))
     check("__name__ 非空", bool(meta.get("__name__")))
-    check("__version__ = 1.0.2", meta.get("__version__") == "1.0.2")
+    check("__version__ = 1.0.3", meta.get("__version__") == "1.0.3")
     check("__min_version__ >= 12.2.10",
           meta.get("__min_version__", "0") >= "12.2.10")
 
@@ -172,10 +172,7 @@ def test_latest():
 def test_all_versions():
     print("== 历史版本归档完整性 ==")
     for ver in ALL_VERSIONS:
-        if ver == "v1.0.2":
-            path = PLUGIN_PATH
-        else:
-            path = os.path.join(VERSIONS_DIR, ver, "filter_enhancement.plugin")
+        path = os.path.join(VERSIONS_DIR, ver, "filter_enhancement.plugin")
         exists = os.path.isfile(path)
         check("%s 存在" % ver, exists)
         if not exists:
@@ -198,9 +195,32 @@ def test_all_versions():
     check("v1.0.2 含装箱修复", "JInteger" in src and "JLong" in src)
 
 
+def test_v103_listener_hooks():
+    print("== v1.0.3 列表点击派发钩子（点击无效/长按无效修复）==")
+    src, tree = parse(PLUGIN_PATH)
+    method_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    check("含 _install_listener_hooks", "_install_listener_hooks" in method_names)
+    check("含 _before_list_item_click", "_before_list_item_click" in method_names)
+    check("含 _before_list_item_long_click", "_before_list_item_long_click" in method_names)
+    check("含 _placeholder_for_view（父链解析）", "_placeholder_for_view" in method_names)
+    # createView 钩子必须调用监听器安装（懒安装入口）
+    call_ok = False
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_install_listener_hooks"):
+            call_ok = True
+    check("createView 中调用 _install_listener_hooks", call_ok)
+    # 点击消费必须 setResult(None)（跳过原监听器）
+    check("点击钩子消费事件（setResult(None)）", "param.setResult(None)" in src)
+    check("长按钩子消费事件（setResult(JBoolean(True))）",
+          "param.setResult(JBoolean(True))" in src)
+
+
 def main():
     test_latest()
     test_all_versions()
+    test_v103_listener_hooks()
     print("\n通过 %d 项，失败 %d 项。" % (PASSED[0], FAILED[0]))
     return 1 if FAILED[0] else 0
 
