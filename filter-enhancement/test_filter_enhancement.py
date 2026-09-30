@@ -25,7 +25,7 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_PATH = os.path.join(HERE, "filter_enhancement.plugin")
 VERSIONS_DIR = os.path.join(HERE, "versions")
-ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4"]
+ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4", "v1.0.5"]
 
 PASSED = [0]
 FAILED = [0]
@@ -104,7 +104,7 @@ def arg_kind(arg):
 
 
 def test_latest():
-    print("== 主版本（filter_enhancement.plugin，应为 v1.0.4）==")
+    print("== 主版本（filter_enhancement.plugin，应为 v1.0.5）==")
     src, tree = parse(PLUGIN_PATH)
 
     compile(src, PLUGIN_PATH, "exec")
@@ -115,7 +115,7 @@ def test_latest():
     check("__id__ 符合宿主格式",
           bool(re.match(r"^[a-zA-Z][a-zA-Z0-9_-]{1,31}$", meta.get("__id__", ""))))
     check("__name__ 非空", bool(meta.get("__name__")))
-    check("__version__ = 1.0.4", meta.get("__version__") == "1.0.4")
+    check("__version__ = 1.0.5", meta.get("__version__") == "1.0.5")
     check("__min_version__ >= 12.2.10",
           meta.get("__min_version__", "0") >= "12.2.10")
 
@@ -379,9 +379,12 @@ def _fresh_plugin(module):
     plugin = module.FilterEnhancementPlugin()
     plugin._views = {}
     plugin._states = {}
-    plugin._diag = {"taps": 0, "longs": 0, "menu_miss": 0}
+    plugin._diag = {"taps": 0, "longs": 0, "menu_miss": 0,
+                    "menu_calls": 0, "listener_calls": 0, "created": 0, "bound": 0}
     plugin._listener_hooks_done = False
     plugin._listener_hooks_dead = False
+    plugin._click_hook_ok = False
+    plugin._longclick_hook_ok = False
     plugin._hooks_total = 10
     plugin.log = lambda message: None
     plugin.dispatched = []
@@ -506,12 +509,141 @@ def test_v104_wiring():
     check("v1.0.4 含 createMenu 主路径", "_before_create_menu" in src)
 
 
+class _FakeJavaView:
+    """android.view.View stand-in that tracks clickable / click listeners."""
+
+    def __init__(self, *args, **kwargs):
+        self.clickable = False
+        self.click_listener = None
+        self.long_listener = None
+
+    def setClickable(self, value):
+        self.clickable = bool(value)
+
+    def isClickable(self):
+        return self.clickable
+
+    def setOnClickListener(self, listener):
+        self.click_listener = listener
+        self.clickable = True          # mirrors View.setOnClickListener
+
+    def setOnLongClickListener(self, listener):
+        self.long_listener = listener
+        self.clickable = True
+
+    def __getattr__(self, item):                                  # noqa: D105
+        return lambda *a, **k: None
+
+
+class _FakeHolder:
+    def __init__(self, item_view):
+        self.itemView = item_view
+
+
+class _FakeActivity:
+    def getParentActivity(self):
+        return _JStub("Context")
+
+
+def _build_placeholder(plugin, activity, adapter="adapter"):
+    """Drive _before_create_view_holder with viewType -1001 and return the row view."""
+    plugin._activity_for_adapter = lambda _adapter: activity
+    param = _FakeParam([_JStub("parent"), -1001])
+    param.thisObject = adapter
+    plugin._before_create_view_holder(param)
+    holder = param.result
+    return holder.itemView if holder is not None else None
+
+
+def test_v105_row_must_stay_non_clickable():
+    print("== v1.0.5 占位条必须不可点击（RecyclerListView 条目分派的前提）==")
+    module = load_plugin_module()
+    module.FrameLayout = _FakeJavaView
+    module.TextView = _FakeJavaView
+    module.FrameLayoutParams = lambda *a, **k: None
+    module.RecyclerViewLayoutParams = lambda *a, **k: None
+    module.RecyclerListViewHolder = _FakeHolder
+    activity = _FakeActivity()
+
+    # A) 列表级钩子可用 → 行内不得挂监听器（clickable 必须为 False）
+    plugin = _fresh_plugin(module)
+    plugin._menu_hook_ok = True
+    row = _build_placeholder(plugin, activity)
+    check("占位条创建成功", row is not None)
+    check("根视图被显式置为不可点击", row is not None and row.clickable is False)
+    check("主路径可用时不挂行内点击监听器", row is not None and row.click_listener is None)
+    check("主路径可用时不挂行内长按监听器", row is not None and row.long_listener is None)
+    check("占位条创建计数 +1", plugin._diag["created"] == 1)
+
+    # B) 无任何列表级钩子 → 保留行内监听器作为兜底
+    plugin2 = _fresh_plugin(module)
+    plugin2._menu_hook_ok = False
+    row2 = _build_placeholder(plugin2, activity, adapter="adapter2")
+    check("无列表级钩子时保留行内兜底监听器",
+          row2 is not None and row2.click_listener is not None and row2.long_listener is not None)
+
+
+def test_v105_wiring():
+    print("== v1.0.5 接线与版本演化 ==")
+    src, tree = parse(PLUGIN_PATH)
+
+    fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_before_create_view_holder":
+            fn = node
+    check("定位 _before_create_view_holder", fn is not None)
+    if fn is not None:
+        set_clickable_lines = []
+        listener_lines = []
+        for n in ast.walk(fn):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+                continue
+            if n.func.attr == "setClickable":
+                set_clickable_lines.append(n.lineno)
+            if n.func.attr in ("setOnClickListener", "setOnLongClickListener"):
+                listener_lines.append(n.lineno)
+        check("显式调用 root.setClickable(False)", bool(set_clickable_lines))
+        check("setClickable 早于任何行内监听器挂载",
+              bool(set_clickable_lines) and bool(listener_lines)
+              and min(set_clickable_lines) < min(listener_lines))
+
+        # 行内监听器必须被「无列表级钩子」的条件守卫
+        guarded = False
+        for n in ast.walk(fn):
+            if not isinstance(n, ast.If):
+                continue
+            # 守卫条件里钩子标志可能以属性形式（self._x）或 getattr 的字符串键出现
+            names = {t.attr for t in ast.walk(n.test) if isinstance(t, ast.Attribute)}
+            names |= {t.value for t in ast.walk(n.test)
+                      if isinstance(t, ast.Constant) and isinstance(t.value, str)}
+            has_listener = any(
+                isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                and c.func.attr in ("setOnClickListener", "setOnLongClickListener")
+                for c in ast.walk(n))
+            if has_listener and {"_menu_hook_ok", "_click_hook_ok", "_longclick_hook_ok"} & names:
+                guarded = True
+        check("行内监听器仅在无列表级钩子时作为兜底挂载", guarded)
+
+    # 诊断计数器齐全
+    for key in ("menu_calls", "listener_calls", "created", "bound"):
+        check("诊断计数器含 %s" % key, '"%s": 0' % key in src)
+
+    # 版本演化：v1.0.4 不得含不可点击修复（历史保真），v1.0.5 必须含
+    v104 = os.path.join(VERSIONS_DIR, "v1.0.4", "filter_enhancement.plugin")
+    if os.path.isfile(v104):
+        src104, _ = parse(v104)
+        check("v1.0.4 不含不可点击修复（历史保真）", "setClickable(False)" not in src104)
+    check("v1.0.5 含不可点击修复", "setClickable(False)" in src)
+
+
 def main():
     test_latest()
     test_all_versions()
     test_v103_listener_hooks()
     test_v104_create_menu_dispatch()
     test_v104_wiring()
+    test_v105_row_must_stay_non_clickable()
+    test_v105_wiring()
     print("\n通过 %d 项，失败 %d 项。" % (PASSED[0], FAILED[0]))
     return 1 if FAILED[0] else 0
 

@@ -4,7 +4,7 @@
 移植为 `Keeperorowner/NagramXF` 的 Python 插件（exteraGram 式插件 SDK）。
 
 - 插件文件：`filter_enhancement.py`（单文件，无外部依赖）
-- 插件 ID：`filter_enhancement`，版本 1.0.4
+- 插件 ID：`filter_enhancement`，版本 1.0.5
 - 目标宿主：Keeperorowner/NagramXF **plugin 构建**（dev 分支，`min_version = 12.2.10`）
 
 ## 一、功能对照
@@ -36,6 +36,11 @@
    等私有成员。若宿主版本混淆策略变化导致反射失败，对应钩子静默降级为上游原生行为，
    不会造成崩溃（全部钩子均有 try/except 保护并输出日志）。
 5. **`getMatchedStruckText` 未移植。** 该 API 服务于已移除的删除线展示，终态无调用方。
+6. **维护须注意：占位条根视图必须保持不可点击。** 原 Java 补丁是在 `FilterHiddenView`
+   内部自行处理触摸（宿主不给它派发条目点击），插件没有独立 View 类，只能依赖
+   RecyclerListView 的条目分派。一旦占位条变为 clickable，宿主会跳过手势检测器
+   （详见下文 v1.0.5），点击与长按将同时失效。改动 `_build_placeholder_view` 或
+   行内监听器挂载逻辑时务必保持该约束。
 
 ## 三、配置项（插件设置页）
 
@@ -77,12 +82,55 @@ normal 构建中 `PluginsController` 为空壳，无插件功能）。
 
 - **插件设置页内置「钩子状态」行**（10 个钩子应全部安装成功）。若有缺失，该行会红色标注
   实际数量；缺失时对应功能自动降级为上游原生行为，请截图该行并反馈宿主版本号。
-- **「交互诊断」行**：显示 `createMenu` 钩子 / 列表监听器钩子的安装状态与点击、长按命中次数。
-  点击占位条后命中次数不增加，说明触摸未派发到拦截点（宿主分派路径不同），
-  请连同该行截图与日志一并反馈。
+- **「交互诊断」行**：显示两级钩子的安装状态、**钩子被调用次数**、占位条创建/绑定次数、
+  点击与长按命中次数。三种情形可直接区分：
+  - 安装正常但「钩子被调用 = 0」→ 触摸未派发到拦截点（宿主分派路径不同，或行被误置为可点击）；
+  - 「被调用 > 0 但命中 = 0」→ 派发到达但行未被识别（`_views` 注册/父链解析问题）；
+  - 「命中 > 0」→ 功能正常。
+  反馈时请附该行截图与日志中 `filter_enhancement` / `createMenu hook invoked` 相关行。
 - 插件日志经宿主 `AppUtils.log` 输出，前缀 `[filter_enhancement]`；可用日志工具检索。
 
 ### 已修复的历史问题
+
+**v1.0.5 — 占位条必须不可点击（第三轮真机日志确诊的最终根因）**
+
+第三轮日志证明 v1.0.4 的拦截层本身是健康的：
+
+```
+D/AppUtils: hooks installed: 10/10
+D/AppUtils: listener hooks (secondary path): click=True long=True
+```
+
+`createMenu`（6 参）主钩与两个匿名监听器钩**全部安装成功、零异常**，却**没有任何点击/长按命中记录**——说明触摸根本没有派发到这些方法。根因在宿主触摸派发的入口，而非拦截点：
+
+`RecyclerListView$RecyclerListViewItemClickListener.onInterceptTouchEvent()` 在 `ACTION_DOWN` 时做两件事：
+
+```java
+childEvent = MotionEvent.obtain(0, 0, action, x - left, y - top, 0);
+if (currentChildView.onTouchEvent(childEvent)) interceptedByChild = true;   // ①
+...
+if (currentChildView != null && !interceptedByChild) {
+    gestureDetector.onTouchEvent(event);                                   // ② 唯一喂手势检测器处
+}
+```
+
+- `View.setOnClickListener()` 会把视图置为 `clickable`，而 **clickable 视图的 `onTouchEvent()` 对合成 DOWN 返回 `true`** → ① 置 `interceptedByChild = true` → ② 被跳过。
+- 手势检测器是**唯一**触发 `onSingleTapUp` / `onLongPress` 的地方，跳过即意味着
+  `onItemClickListener` / `onItemLongClickListener` 永不派发，`createMenu` 也永不调用。
+- 结果：**占位条照常渲染，点击与长按同时全死，且日志全静默**——正是上报症状。
+- 姊妹插件 `filter-sentinel` 的提交 `v2.4.0: bar must stay non-clickable` 即同一结论。
+
+修复：占位条根视图**不再挂载** `OnClickListener` / `OnLongClickListener`，并显式
+`setClickable(False)`（内层 `hint` TextView 一并显式置否——同一处判定还会检查行的
+**直接子视图**是否 clickable）。交互统一由列表层拦截点（`createMenu` 主路径 +
+匿名监听器次级路径）承接；只有当两级列表层钩子**都**不可用时，才回退到行内监听器，
+此时会打日志说明。
+
+诊断升级：设置页「交互诊断」行新增「钩子被调用次数」与「占位条创建/绑定次数」。
+由此可一次判定三种情形——`钩子被调用=0`（触摸未派发至拦截点）、`被调用>0 但命中=0`
+（行未被识别）、`命中>0`（功能正常）。日志中对应新增
+`createMenu hook invoked (first call)`、`list item click hook invoked (first call)`、
+`placeholder view created (first)…clickable=False`、`placeholder bind recognised (first)`。
 
 **v1.0.4 — 交互拦截改挂在 `createMenu` 汇聚点（点击/长按仍无效的根因收敛）**
 
