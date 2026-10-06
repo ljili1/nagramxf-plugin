@@ -1,10 +1,16 @@
 # WS Proxy (tcp2ws) 使用教程 —— 纯 DNS 模式，无需任何服务端
 
-> 对应插件文件：[`ws_proxy.plugin`](./ws_proxy.plugin)（v1.3.15）
+> 对应插件文件：[`ws_proxy.plugin`](./ws_proxy.plugin)（v1.3.20）
 > 离线自测：[`test_ws_proxy.py`](./test_ws_proxy.py)（`python test_ws_proxy.py`，无需 Android 环境）
 >
 > **插件介绍（写在插件里的版本）**：让 Telegram 的流量改走 WebSocket(wss)，绕过部分网络的封锁；
 > 纯客户端方案，只需要一个你自己的域名，不需要任何服务器。本文件是详细教程，插件内只保留三步。
+>
+> ⚠️ **版本可用性**：可以自用的只有 **v1.3.15** 和 **v1.3.19 及之后**。
+> **v1.3.16 / v1.3.17 / v1.3.18 请不要使用**——它们是在排查「连不上 / 反复重连」过程中发出去的
+> 中间版本，问题直到 v1.3.19 才收敛（逐版说明见 §10「版本状态」）。
+> 这三版**从未发布到远端**：推送脚本只上传当前快照，远端 ws-proxy/ 下始终只有
+> ws_proxy.plugin（当前版）、README.md、test_ws_proxy.py 和 versions/v1.2.1/（补丁基线）。
 
 ---
 
@@ -174,6 +180,10 @@ Cloudflare → **SSL/TLS → Overview → 加密模式 = Flexible**。（纯 DNS
 | `HTTP 426` 之类 | 请求没被当成 WebSocket 升级到 Telegram | 检查 A 记录是否指向 Telegram DC IP、模式是否 Flexible |
 | DNS 解析到 `149.154.x` | 忘记勾选 *Proxy imported DNS records* | 删掉记录重新导入（或手动把云朵点成橙色） |
 | TLS 证书错误（SNI 不匹配） | 用了二级域名（`xxx.proxy.example.com`）而通配证书只覆盖一层 | 把「域名」填成最外层域名（apex），或在 CF 里为每个主机名单独签证书（会进 CT 日志） |
+| 反复重连 / 隧道很短就断 | ① 上游（Telegram 经 Cloudflare）主动断开——日志里是 `closed by=server-err:unexpected eof`，属对端行为；② 每次重连都要重新建 TLS，代价高 | v1.3.18 起复用 `SSLContext`、开 `TCP_NODELAY`，并把 App 的 DNS 选择器接进来，重连更快更省电。若同一个子域名几乎每次都秒断，优先怀疑 DNS 给错地址（看启动时的 `DNS 自检`） |
+| 想让插件用 DoH 而不是本机 DNS | 宿主的 DNS 设置原先管不到插件用的 Python 解析器 | **v1.3.18 起已接上**：设置 → NagramX/Neko → 通用 → **「DNS 解析器」**，从“系统”改成任一 DoH 项（或“自定义 DoH”填 `https://1.0.0.1/dns-query`），插件的解析立刻跟着走 DoH |
+| 日志刷 `[Errno 101] Network is unreachable` | 能解析但连不出去：① 本机 DNS 被污染，返回了不可路由的地址；② 手机网络本身没有出口（Wi-Fi 无外网 / 数据关了） | 把 App 设置 →「DNS 解析器」从 System 改成任一 DoH 项 重新解析并重试，同时日志里打出「试过哪些地址」。对照启动时的 `DNS 自检：… -> <IP>`：**不是 Cloudflare 的 IP 就是被污染** |
+| 日志被 `[Errno 7] No address associated with hostname` 刷屏 | 本机 DNS 查不到**当前**子域名——最常见的是改过「域名 / 子域标签」，而 Cloudflare 里的记录还是旧的 | v1.3.16 起会自动限流并提示；点「复制 DNS 记录到剪贴板」重新 Import。若本机 DNS 本身有问题，把「DNS 解析器」改成 DoH |
 | 换过「子域名随机串」后全部失败 | 子域名变了，DNS 还是旧的 | 重新生成模板并重导 DNS（见 §6） |
 | **设置页打不开**，日志 `Failed to load plugin settings` + `Selector.__init__() got an unexpected keyword argument 'subtext'` | 宿主 `ui.settings.Selector` 不支持 `subtext`（只有 `Switch`/`Input`/`Text` 有）。v1.3.0 犯过；宿主是在 `loadPluginSettings()` 里反射构造设置项的，**任何一个未知参数都会让整页设置加载失败** | 升级到 **v1.3.1**（移除该参数）；**v1.3.15** 起所有设置项统一走 `item()` 兜底，宿主不认识的参数直接丢弃，同类崩溃不会再让整页失效 |
 | 复制出来的 DNS 记录粘到 Cloudflare 只有一行 / Import 报格式错误 | v1.3.14 及更早用 `Input` 承载记录，点开的是宿主**单行**输入框，换行被 Android 的 `SingleLineTransformationMethod` 换成空格 | 升级到 **v1.3.15**：改用「一键写剪贴板 + 多行文本框」，换行原样保留（见 §4.2） |
@@ -267,11 +277,113 @@ v1.3.x 起改成自动生成子域名后，名字变成"每个部署独有 + 无
 
 ## 10. 变更记录
 
+### 版本状态（先看这个表）
+
+| 版本 | 状态 | 说明 |
+|---|---|---|
+| **v1.3.20** | 当前版本 | 解析交给宿主 DnsFactory（已在真机验证）+ 修「关掉再打开代理起不来」（EADDRINUSE） |
+| v1.3.19 | ✅ 可用 | 删掉插件自己那份 DoH，改用宿主解析器；**真机已确认 DnsFactory 被调用且解析成功** |
+| v1.3.18 | ⛔ **不要使用** | 自带一份重复的 DoH；未通过真机验证，已被 v1.3.19 取代 |
+| v1.3.17 | ⚠️ **不推荐** | 真机已能建立隧道并跑数据，但隧道频繁被上游断开、重连密集；这一点是 v1.3.19 才处理的 |
+| v1.3.16 | ⛔ **不要使用** | DoH 兜底只挂在 gaierror 上，抓不到「能解析但不可路由」的污染地址；真机表现为代理完全连不上 |
+| v1.3.15 | ✅ 可用 | 修好 DNS 记录的复制/导入（换行被吞）；**远端当前发布的就是这一版** |
+| v1.3.14 及更早 | ⚠️ 有已知问题 | DNS 记录用 Input 承载，点开是宿主单行输入框，复制出来只剩一行，Cloudflare 导入会失败 |
+
+> 说明：**远端只保留当前快照**，历史版本不会逐个上传；上表标记不可用的版本仅存在于开发机，
+> 公开仓库里拿不到，也不会被推送脚本上传（脚本只复制 README.md、ws_proxy.plugin、
+> test_ws_proxy.py 和 versions/v1.2.1/ 这几个白名单文件）。
+
+
 > **读旧条目时的更正说明（2026-10）**：v1.3.15 之前的几条变更记录里写着“宿主 `Text` 不派发点击”，
 > 这个结论**是错的**。核对本构建（`30dcd6c`）的 `PluginSettingsActivity.onClick()` 后确认：
 > `TextSetting.onClickCallback` 会被调用（`textSetting.onClickCallback.call(view)`，紧跟在
 > `createSubFragmentCallback` 分支之后）。v1.3.15 起重新使用 `Text` 做「复制 DNS 记录到剪贴板」。
 > 下面 v1.3.7 / v1.3.9 / v1.3.13 等条目里的相关表述请以本说明为准。
+
+### v1.3.20
+- **修「关掉代理再打开，它没起来」**：真机日志里 `tcp2ws stopped (tore down N tunnels)` 之后紧接着
+  `bind 127.0.0.1:6356 failed: [Errno 98] Address already in use`（两个会话各出现一次）。
+  根因：`stop()` 只是 `close()` 了监听 socket，而 `accept()` 可能正阻塞在那个 fd 上——
+  这个 in-flight 的系统调用会继续持有内核 socket，端口不会立刻释放，紧接着的 `start()` 就绑不上。
+  现在 `stop()` 先 `shutdown()` 唤醒阻塞的 accept，再 `close()`，并 `join()` accept 线程（1.5s 上限），
+  确保端口干净释放后才返回；`start()` 再对 EADDRINUSE 做退避重试（最多 6 次、约 3s）。
+- **缓存地址连不上就立刻丢弃**：v1.3.17 起的「上次连通地址」缓存，若那个 IP 后来不可达，
+  每次拨号都会先浪费一次超时再回退（真机日志：`ws dial … 超时：cache:172.67.159.72`）。
+  现在连接失败即清掉该缓存项，下一次直接换别的地址。
+- 自测新增 2 项：**真实 socket 的 start → stop（并断言 accept 线程已退出）→ 立刻再 start**、
+  失败后缓存地址被清除。
+
+### v1.3.19
+- **删掉插件自带的那份 DoH，统一用宿主自带的解析器**。App 的「DNS 解析器」里已经有 DoH
+  （默认 1.1.1.1 / 1.0.0.1 / 8.8.8.8 / 8.8.4.4，也可填自定义），还自带 dnsjava 缓存、
+  按设备 IPv4/IPv6 能力选 A/AAAA、DoH 失败回退系统 DNS —— 插件再写一份纯属重复，
+  而且复刻不了 App 的策略。现在解析链只有两级：
+  ①（v1.3.18 已接的）`DnsFactory.lookup()`；② 系统 DNS 兜底（宿主若没有 `DnsFactory` 这个类）。
+  删掉的东西：`DOH_ENDPOINTS` / `_doh_http_get()` / `doh_resolve()` 以及相关缓存常量（净减约 70 行），
+  `import json` 也随之不再需要。
+  > v1.3.16/1.3.17 变更记录里那条"插件自己用 DoH 兜底"已被本条取代，仅作历史保留。
+- 解析失败时的提示改为直接指向 App 设置：**设置 → 通用 →「DNS 解析器」从 System 改成任一 DoH 项**。
+- 自测相应重写（共 16 项）：宿主无 `DnsFactory` 时安全降级 / 系统 DNS 正常时直连 /
+  解析全失败抛 gaierror / IPv4 优先排序 / **App 解析器地址优先于系统 DNS** /
+  **App 解析器地址连不上时回退系统 DNS** / App 结果走缓存 / 记住连通地址 /
+  不可路由地址记进 LAST_DIAL_TRACE / ENETUNREACH 识别 / SSLContext 复用 /
+  TCP_NODELAY / 隧道关闭日志限流 / 失败分类 / 失败日志限流与汇总。
+
+### v1.3.18
+- **接上 App 自带的 DNS 选择器**：宿主（Nekogram/NagramXF）本来就有
+  `tw.nekomimi.nekogram.utils.DnsFactory`，由 App 设置里的
+  **「DNS 解析器」(DNS Resolver)** 控制（系统 / 自定义 DoH 等）。插件现在直接调它
+  （`DnsFactory.lookup(host)`，`@JvmStatic`），而不是自己另搞一套 DoH。好处：
+  * **尊重你在 App 里选的 DNS**——把「DNS 解析器」从“系统”改成任一 DoH 项，
+    插件也跟着走 DoH，本机 DNS 被污染时这条链路就直接绕开了；
+  * 它会按设备**实际的 IPv4/IPv6 能力**决定查 A 还是 AAAA。本机 tgnet 全程 `ipv6:0`
+    （纯 IPv4），插件自己猜地址族只会白撞 ENETUNREACH，这段逻辑正好补上；
+  * 它自带 dnsjava 的缓存，并在 DoH 失败后回退系统 DNS。
+  调用放在后台线程里等最多 1.5 秒，超时不影响本轮（Java 那边继续跑并把结果写进它自己的缓存）；
+  结果插件再缓存 60 秒。
+- **复用 SSLContext**：`ws_connect()` 原先每次拨号都 `ssl.create_default_context()`，
+  而它每次都要重新读取并解析整份系统 CA 库。真机日志里 30 秒出现过 5800 次拨号，
+  这个开销非常可观；复用后还让 TLS 会话票据有机会复用，握手少一个 RTT。
+- **建连开 `TCP_NODELAY`**（上游 socket + 本机 SOCKS5 客户端 socket）：
+  MTProto 全是小包，Nagle 会白攒最多 ~40ms 才发，代理场景必须关。
+- **隧道关闭日志限流 + 关闭原因说清楚**：原来 27 秒能刷 40 条 `closed by=server-err:WsError`，
+  现在同一 (子域名, 原因) 每 5 秒最多一条并汇总；`by=` 也带上具体信息
+  （如 `server-err:unexpected eof`，即对端直接断开、没发 WebSocket close 帧）。
+- 自测新增 6 项：SSLContext 复用 / App DNS 解析 / App DNS 走缓存 /
+  **App DNS 地址优先于系统 DNS** / 建连开 TCP_NODELAY / 隧道关闭日志限流。共 18 项。
+
+### v1.3.17
+- **修「能解析、但连不出去」**：真机日志里每条拨号都是
+  `ws dial <子域名> failed: [Errno 101] Network is unreachable`（ENETUNREACH），
+  52 秒内重试了 5801 次。这种失败 **getaddrinfo 并不报错**——
+  DNS 被污染时会返回「能解析但不可路由」的地址，只有 connect 阶段才炸，
+  所以 v1.3.16 只在 `gaierror` 上兜底是抓不到的。现在拨号改成三层保险（共用同一条时间预算）：
+  1. 复用**上次连通的地址**（缓存 2 分钟），省掉反复解析；
+  2. 系统 DNS 的结果**逐个试，IPv4 排在 IPv6 前面**——实测机型是 IPv4-only
+     （tgnet 全程 `ipv6:0`、`ipv6:1` 一次都没有），而 Cloudflare 代理记录同时返回
+     A 和 AAAA，getaddrinfo 常把 IPv6 排前面，白撞一次 ENETUNREACH；
+  3. 系统 DNS 的地址**全部连不上**时，用 DoH 重新解析再试一遍（留 40% 时间预算，
+     防止污染地址被黑洞后吃光时间）。
+- **新增启动自检**：每次启动在后台线程里解析一次 DC1 子域名并写日志
+  `DNS 自检：<子域名> -> <IP>`。**如果这里不是 Cloudflare 的 IP，就是本机 DNS 被污染**，
+  一眼可判。（用后台线程是因为 `getaddrinfo` 没有超时参数，不能卡住插件队列。）
+- **失败日志说清「试过哪些地址」**：失败时记录逐个地址的错误（最多 4 条），
+  并对 ENETUNREACH/EHOSTUNREACH 单独给提示，不再只有一句看不出所以然的 Errno 101。
+- 自测新增 6 项：IPv4 优先排序 / **地址不可路由时改用 DoH 重试（DNS 污染场景）** /
+  记住连通地址 / ENETUNREACH 识别 / gaierror 兜底 / 正常时不走 DoH。
+
+### v1.3.16
+- **解析失败不再刷屏，并给出可操作提示**：原先每条隧道失败都打一行，真机日志里
+  `ws dial <子域名> failed: [Errno 7] No address associated with hostname` 重复了 **18666 次**
+  （单文件 2.4 MB），把有用信息全淹了。现在按 (子域名, 原因) **每 60 秒最多记一条**，
+  被压掉的条数在下一行汇总；解析失败时直接提示「多半是改了域名/子域标签而 Cloudflare 记录还是旧的，
+  去设置页点『复制 DNS 记录到剪贴板』重新 Import 一遍」。
+- **新增 DNS-over-HTTPS 兜底解析**：系统 DNS 查不到上游子域名时，用「固定 IP + SNI」直连
+  `cloudflare-dns.com` / `dns.alidns.com` / `dns.google` 的 JSON API 解析，再按 IP 直连
+  （SNI 仍是你的域名，证书校验不变）。结果缓存 5 分钟、失败只缓存 20 秒、总预算 4 秒；
+  **只在系统解析失败时才触发**，所以 DNS 正常时行为与耗时完全不变。
+- 自测新增 8 项：DoH JSON 解析 / 命中缓存 / A→AAAA 回退 / 解析失败时按 IP 直连 /
+  DNS 正常时不走 DoH / 失败原因分类 / 日志限流与汇总。
 
 ### v1.3.15
 - **修好「DNS 记录导入不进去」**：v1.3.14 及更早把记录放在 `Input` 里，而 `Input` 点开的是宿主

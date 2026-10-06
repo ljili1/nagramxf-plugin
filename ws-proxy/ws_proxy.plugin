@@ -22,7 +22,7 @@ __description__ = (
     "在设置页填好域名、按提示配好 DNS 记录后打开开关即可使用。"
 )
 __author__ = "ljili (port of qwq233/Nullgram)"
-__version__ = "1.3.15"
+__version__ = "1.3.20"
 
 import base64
 import hashlib
@@ -427,8 +427,223 @@ def parse_abridged_err(plain, total_len):
 # ---------------------------------------------------------------------------
 # 纯 stdlib 的 WebSocket 客户端（仅实现所需子集：二进制帧、ping/pong、close）
 # ---------------------------------------------------------------------------
+#
+# 域名解析：直接用宿主自带的 DNS 选择器，插件不再自己实现一份 DoH。
+#   tw.nekomimi.nekogram.utils.DnsFactory（Nekogram）
+#   由 App 设置 → 通用 →「DNS 解析器」(DNS Resolver) 控制：
+#     System / 自定义 DoH …, 自带 dnsjava 缓存，会按设备实际的 IPv4/IPv6 能力
+#     决定查 A 还是 AAAA，并在 DoH 失败后回退系统 DNS。
+#   自己再写一份 DoH 只会重复，也没法复刻 App 的策略（见 app_dns_lookup）。
+#   系统 DNS 仅作为兜底保留：万一宿主版本没有 DnsFactory 这个类。
+LAST_RESOLVE_SOURCE = "dns"   # "appdns" / "dns" / "cache"
+LAST_DIAL_TRACE = ""           # 失败时记录「试过哪些地址、各自什么错」，一次把话说清
+BEST_ADDR_TTL = 120.0          # 上次连通的地址缓存 2 分钟，避免每次都重新解析
+_best_addr = {}                # host -> (expire_ts, ip)
+_best_lock = threading.Lock()
+
+_ssl_ctx = {}                  # insecure -> SSLContext（复用，见 tls_context）
+_ssl_ctx_lock = threading.Lock()
+_app_dns_cache = {}            # host -> (expire_ts, tuple_of_ips)
+_app_dns_lock = threading.Lock()
+APP_DNS_TTL = 60.0
+
+# App 自带的 DNS 选择器（Nekogram 的 DnsFactory；宿主没有这个类时为 None）
+try:
+    _DnsFactory = jclass("tw.nekomimi.nekogram.utils.DnsFactory")
+except Exception:
+    _DnsFactory = None
+
+
+def tls_context(insecure=False):
+    """复用 SSLContext。
+
+    ws_connect() 原先每次拨号都调 ssl.create_default_context()，而它每次都要重新读取
+    并解析整份系统 CA 库。真机日志里 30 秒出现过 5800 次拨号，这个开销很可观。
+    复用同一个 context 还有个附带好处：TLS 会话票据有机会复用，握手少一个 RTT。
+    """
+    key = bool(insecure)
+    with _ssl_ctx_lock:
+        ctx = _ssl_ctx.get(key)
+    if ctx is None:
+        ctx = ssl._create_unverified_context() if key else ssl.create_default_context()
+        with _ssl_ctx_lock:
+            _ssl_ctx[key] = ctx
+    return ctx
+
+
+def _dnsfactory_lookup(host):
+    """调一次 App 自带的 DnsFactory.lookup（@JvmStatic）。"""
+    if _DnsFactory is None:
+        return []
+    out = []
+    for a in _DnsFactory.lookup(host, False):
+        try:
+            ip = a.getHostAddress()
+        except Exception:
+            continue
+        if ip and ip not in out:
+            out.append(ip)
+    return out
+
+
+def app_dns_lookup(host, wait=1.5):
+    """用 App 设置里的「DNS」选择器解析（系统 DNS / DoH / 自定义 DoH）。
+
+    为什么优先用它，而不是插件自己再搞一套 DoH：
+      * 它尊重用户在 App 里选的 DNS；
+      * 它会按设备**实际的 IPv4/IPv6 能力**决定查 A 还是 AAAA ——
+        本机 tgnet 全程 ipv6:0（纯 IPv4），正是这段逻辑该处理的场景，
+        插件自己猜地址族只会白撞 ENETUNREACH；
+      * 它自带 org.xbill 的 DNS 缓存，并会在 DoH 失败后回退系统 DNS。
+
+    wait 秒内没结果就放弃本轮回退到其它路径；Java 调用在后台线程继续跑完，
+    结果进它自己的缓存，下次拨号就能快速命中。
+    """
+    if _DnsFactory is None:
+        return []
+    now = time.time()
+    with _app_dns_lock:
+        hit = _app_dns_cache.get(host)
+        if hit and hit[0] > now:
+            return list(hit[1])
+    box = {}
+
+    def _run():
+        try:
+            box["ips"] = _dnsfactory_lookup(host)
+        except Exception:
+            box["ips"] = []
+
+    t = threading.Thread(target=_run, name="wsproxy-appdns", daemon=True)
+    t.start()
+    t.join(max(0.2, wait))
+    ips = box.get("ips") or []
+    with _app_dns_lock:
+        _app_dns_cache[host] = (time.time() + (APP_DNS_TTL if ips else 15.0), tuple(ips))
+    return ips
+
+
+def system_addrs(host, port):
+    """系统 DNS 的解析结果，**IPv4 排在 IPv6 前面**。返回 (ips, error)。"""
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except Exception as e:
+        return [], e
+    seen = []
+    for _fam, _type, _proto, _canon, sa in infos:
+        if sa and sa[0] not in seen:
+            seen.append(sa[0])
+    v4 = [a for a in seen if ":" not in a]
+    v6 = [a for a in seen if ":" in a]
+    return v4 + v6, None
+
+
+def _remember_addr(host, ip):
+    with _best_lock:
+        _best_addr[host] = (time.time() + BEST_ADDR_TTL, ip)
+
+
+def _forget_addr(host, ip):
+    """拨号失败时清掉缓存：下次换别的地址，不再先浪费一次超时。"""
+    with _best_lock:
+        hit = _best_addr.get(host)
+        if hit and hit[1] == ip:
+            _best_addr.pop(host, None)
+
+
+def _cached_addr(host):
+    with _best_lock:
+        hit = _best_addr.get(host)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    return None
+
+
+def dial_tcp(host, port, timeout):
+    """连 host:port，返回已连接的 socket。三层，共用同一条时间预算：
+
+      1. 复用上次连通的地址（缓存 2 分钟）——省掉反复解析；
+      2. **宿主自带的 DNS 选择器**（DnsFactory，见 app_dns_lookup）：
+         尊重 App 里的「DNS 解析器」设置，并按设备实际的 IPv4/IPv6 能力选 A/AAAA；
+      3. 系统 DNS 兜底，**IPv4 排在 IPv6 前面**（实测机型纯 IPv4，tgnet 全程 ipv6:0，
+         而 Cloudflare 代理记录同时有 A 和 AAAA，IPv6 排前面只会白撞 ENETUNREACH）。
+
+    解析全部交给宿主的解析器，插件不再自己实现 DoH：
+    App 里把「DNS 解析器」从 System 改成任一 DoH 项，解析就会走 DoH。
+    """
+    global LAST_RESOLVE_SOURCE, LAST_DIAL_TRACE
+    deadline = time.time() + max(1.0, timeout)
+    errors = []
+    tried = set()
+
+    def _try(ip, source):
+        # 注意：嵌套函数里必须再声明一次 global，否则下面的赋值只会创建局部变量，
+        # 模块级的 LAST_RESOLVE_SOURCE / LAST_DIAL_TRACE 永远不更新（诊断会全部失效）。
+        global LAST_RESOLVE_SOURCE, LAST_DIAL_TRACE
+        if ip in tried:
+            return None
+        tried.add(ip)
+        left = deadline - time.time()
+        if left <= 0.2:
+            errors.append("%s: skipped(budget)" % ip)
+            return None
+        try:
+            sock = socket.create_connection((ip, port), timeout=left)
+            try:
+                # MTProto 全是小包，Nagle 会额外攒最多 ~40ms 才发；代理场景必须关掉
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+        except Exception as e:
+            errors.append("%s: %s" % (ip, str(e)[:60]))
+            _forget_addr(host, ip)
+            return None
+        _remember_addr(host, ip)
+        LAST_RESOLVE_SOURCE = source
+        LAST_DIAL_TRACE = "%s:%s" % (source, ip)
+        return sock
+
+    cached = _cached_addr(host)
+    if cached:
+        sock = _try(cached, "cache")
+        if sock is not None:
+            return sock
+
+    # 优先用 App 自带的 DNS 选择器（尊重 App 的 DNS 设置，并按设备能力选 A/AAAA）
+    app_ips = app_dns_lookup(host, wait=min(1.5, max(0.3, (deadline - time.time()) * 0.5)))
+    for ip in app_ips:
+        sock = _try(ip, "appdns")
+        if sock is not None:
+            return sock
+
+    # 兜底：系统 DNS（宿主没有 DnsFactory，或 App 的解析器没给出结果时）
+    addrs, gerr = system_addrs(host, port)
+    if gerr is not None:
+        errors.append("getaddrinfo: %s" % str(gerr)[:60])
+    for ip in addrs:
+        sock = _try(ip, "dns")
+        if sock is not None:
+            return sock
+
+    LAST_DIAL_TRACE = "; ".join(errors[:4]) or ("no address for %s" % host)
+    if gerr is not None and not addrs:
+        raise gerr
+    raise OSError("ws dial %s failed: %s" % (host, LAST_DIAL_TRACE))
+
+
 class WsError(Exception):
     pass
+
+
+def unreachable_hint(err):
+    """ENETUNREACH / EHOSTUNREACH 之类：解析成功但根本连不出去。
+
+    这种最容易被误判成「DNS 坏了」——其实 DNS 是通的（没抛 gaierror），
+    只是返回了不可路由的地址（典型就是本机 DNS 被污染）。
+    """
+    text = str(err or "").lower()
+    return (isinstance(err, OSError) and getattr(err, "errno", None) in (101, 113)
+            ) or "network is unreachable" in text or "no route to host" in text
 
 
 def ws_connect(host, use_tls, user_agent, conn_hash, timeout=3.0, insecure=False, port=None):
@@ -440,13 +655,9 @@ def ws_connect(host, use_tls, user_agent, conn_hash, timeout=3.0, insecure=False
         port = 443 if use_tls else 80
     sock = None
     try:
-        raw = socket.create_connection((host, port), timeout=timeout)
+        raw = dial_tcp(host, port, timeout)
         if use_tls:
-            if insecure:
-                ctx = ssl._create_unverified_context()  # noqa: SLF001（设置项，默认关闭）
-            else:
-                ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(raw, server_hostname=host)
+            sock = tls_context(insecure).wrap_socket(raw, server_hostname=host)
         else:
             sock = raw
         sock.settimeout(timeout)
@@ -631,6 +842,12 @@ class Relay(object):
         self.tunnels_open = 0
         self.tunnels_total = 0
         self.last_error = ""
+        # 拨号失败会按「每个客户端连接」重复触发：tgnet 断线重连时可能每秒好几条。
+        # 真机日志里同一条 Errno 7 出现过 18666 次（2.4 MB），把有用信息全淹了。
+        # 这里按 (host, 原因) 每分钟最多记一条，中间的被压掉并汇总到下一行。
+        self._fail_log = {}
+        self._close_log = {}
+        self.dial_failures = 0
         self.log = logger
 
     # ---- 配置 ----
@@ -665,14 +882,32 @@ class Relay(object):
                 self.configure(self.domain, self.use_tls, self.conn_hash,
                                self.user_agent, self.insecure_tls, self.port,
                                self.labels)
-            try:
-                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                srv.bind(("127.0.0.1", self.port))
-                srv.listen(64)
-                srv.settimeout(1.0)
-            except OSError as e:
-                self.last_error = "bind 127.0.0.1:%d failed: %s" % (self.port, e)
+            # 端口刚被 stop() 释放时，内核可能还要一小会儿才彻底回收，
+            # 真机日志出现过「tcp2ws stopped」之后紧接着
+            # 「bind 127.0.0.1:6356 failed: [Errno 98] Address already in use」——
+            # 表现为关掉再打开代理就没起来。这里退避重试几次。
+            srv = None
+            last_err = None
+            for attempt in range(6):
+                try:
+                    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    srv.bind(("127.0.0.1", self.port))
+                    srv.listen(64)
+                    srv.settimeout(1.0)
+                    break
+                except OSError as e:
+                    last_err = e
+                    try:
+                        srv.close()
+                    except Exception:
+                        pass
+                    srv = None
+                    if getattr(e, "errno", None) != 98 or attempt == 5:   # 98 = EADDRINUSE
+                        break
+                    time.sleep(0.2 * (attempt + 1))
+            if srv is None:
+                self.last_error = "bind 127.0.0.1:%d failed: %s" % (self.port, last_err)
                 self.log(self.last_error)
                 return False
             self._server_sock = srv
@@ -690,10 +925,26 @@ class Relay(object):
             self._stopping.set()
             srv = self._server_sock
             self._server_sock = None
+            accept_thread = self._accept_thread
+            self._accept_thread = None
             tunnels = list(self._tunnels)
         if srv is not None:
+            # 顺序很重要：accept() 可能正阻塞在这个 fd 上，
+            # 那个 in-flight 的系统调用会继续持有内核 socket，
+            # 于是端口不会立刻释放（紧接着 start() 就 EADDRINUSE）。
+            # 先 shutdown 让阻塞的 accept 尽快返回，再 close。
+            try:
+                srv.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
             try:
                 srv.close()
+            except Exception:
+                pass
+        if accept_thread is not None and accept_thread.is_alive():
+            # accept 有 1s 超时，最多等它轮询到 _stopping；等到了端口才算干净
+            try:
+                accept_thread.join(1.5)
             except Exception:
                 pass
         for client, ws in tunnels:
@@ -741,6 +992,10 @@ class Relay(object):
     # ---- SOCKS5 ----
     def _handle_client(self, client):
         client.settimeout(15.0)
+        try:
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         ver = _recv_exact(client, 1)[0]
         if ver != 0x05:
             raise WsError("not socks5 (ver=%d)" % ver)
@@ -793,8 +1048,7 @@ class Relay(object):
             except Exception as e:
                 last_err = e
         if ws_sock is None:
-            self.last_error = "ws dial %s failed: %s" % (server, last_err)
-            self.log(self.last_error)
+            self._log_dial_failure(server, last_err)
             self._socks5_reply(client, 0x05)
             return
 
@@ -805,6 +1059,53 @@ class Relay(object):
         self._socks5_reply(client, 0x00)
         client.settimeout(None)
         self._bridge(client, WsConn(ws_sock, leftover), server)
+
+    # ---- 失败诊断（限流 + 说人话） ----
+    DIAL_LOG_INTERVAL = 60.0   # 同一 (host, 原因) 每 60 秒最多记一条
+
+    @staticmethod
+    def _dial_error_kind(err):
+        """把底层异常归成 resolve / tls / timeout / other，便于给出对症提示。"""
+        text = str(err or "").lower()
+        if isinstance(err, socket.gaierror) or "no address associated" in text \
+                or "name or service not known" in text \
+                or "temporary failure in name resolution" in text:
+            return "resolve"
+        if isinstance(err, ssl.SSLError) or "certificate" in text or "ssl" in text:
+            return "tls"
+        if isinstance(err, (socket.timeout, TimeoutError)) or "timed out" in text \
+                or "timeout" in text:
+            return "timeout"
+        return "other"
+
+    def _log_dial_failure(self, server, err):
+        kind = self._dial_error_kind(err)
+        self.last_error = "ws dial %s failed: %s" % (server, err)
+        now = time.time()
+        with self._lock:
+            self.dial_failures += 1
+            last_ts, suppressed = self._fail_log.get((server, kind), (0.0, 0))
+            if now - last_ts < self.DIAL_LOG_INTERVAL:
+                self._fail_log[(server, kind)] = (last_ts, suppressed + 1)
+                return
+            self._fail_log[(server, kind)] = (now, 0)
+        tail = "" if not suppressed else "（同一条失败已略过 %d 条）" % suppressed
+        trace = LAST_DIAL_TRACE
+        if kind == "resolve":
+            self.log("子域名解析失败：%s —— 本机 DNS 查不到这个域名%s" % (server, tail))
+            self.log("常见原因：「域名 / 子域标签」改过，而 Cloudflare 里的 DNS 记录还是旧的；"
+                     "去设置页点「复制 DNS 记录到剪贴板」，重新 Import 一遍")
+        elif unreachable_hint(err):
+            # 能解析、但连不出去：要么 IP 不可路由（DNS 被污染），要么网络本身不通
+            self.log("ws dial %s 连不上：%s%s" % (server, trace or err, tail))
+            self.log("本机解析到的是这些地址，但一个都连不上（Network is unreachable）。"
+                     "若这些不是 Cloudflare 的 IP，说明本机 DNS 被污染："
+                     "把 App 设置 → 通用 →「DNS 解析器」从 System 改成任一 DoH 项即可绕过；"
+                     "若改了仍失败，请检查网络本身是否不通")
+        elif kind == "timeout":
+            self.log("ws dial %s 超时：%s%s" % (server, trace or err, tail))
+        else:
+            self.log("ws dial %s failed: %s%s" % (server, trace or err, tail))
 
     @staticmethod
     def _socks5_auth(client):
@@ -872,7 +1173,7 @@ class Relay(object):
                     client.sendall(payload)
         except Exception as e:
             if stats["by"] is None:
-                stats["by"] = "server-err:%s" % type(e).__name__
+                stats["by"] = "server-err:%s" % (str(e) or type(e).__name__)[:48]
         finally:
             done.set()
             ws.close()
@@ -901,8 +1202,25 @@ class Relay(object):
                         extra += " w2c_plain=%s" % plain.hex()
             if stats["close"]:
                 extra += " close=%s" % stats["close"].hex()
-            self.log("tunnel %s closed by=%s age=%.1fs c2w=%dB w2c=%dB%s"
-                     % (server, stats["by"], age, stats["c2w"], stats["w2c"], extra))
+            self._log_tunnel_close(server, stats["by"], age, stats["c2w"],
+                                   stats["w2c"], extra)
+
+    # 隧道关闭日志：同一 (子域名, 原因) 每 5 秒最多一条，其余只计数。
+    # 真机一次会话 27 秒关了 40 条隧道，刷太快反而看不出问题。
+    CLOSE_LOG_INTERVAL = 5.0
+
+    def _log_tunnel_close(self, server, by, age, c2w, w2c, extra):
+        now = time.time()
+        key = (server, by)
+        with self._lock:
+            last_ts, suppressed = self._close_log.get(key, (0.0, 0))
+            if now - last_ts < self.CLOSE_LOG_INTERVAL:
+                self._close_log[key] = (last_ts, suppressed + 1)
+                return
+            self._close_log[key] = (now, 0)
+        tail = "" if not suppressed else "（同类关闭已略过 %d 条）" % suppressed
+        self.log("tunnel %s closed by=%s age=%.1fs c2w=%dB w2c=%dB%s%s"
+                 % (server, by, age, c2w, w2c, extra, tail))
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1461,29 @@ class WsProxyPlugin(BasePlugin):
                 lines.append("%s.%s.\t1\tIN\tAAAA\t%s" % (labels[dc], domain, ip))
         return "".join(line + "\n" for line in lines)
 
+    def _log_dns_selfcheck(self):
+        """把「本机解析当前 DC1 子域名得到哪些 IP」写进日志。
+
+        这是排查「代理连不上」最快的一条线索：
+          - 解析失败        -> 十有八九是 DNS 记录与当前子域名不一致（重新 Import）；
+          - IP 不是 Cloudflare 的（104.21/172.67/104.16/172.64 等）
+                            -> 本机 DNS 被污染，此时 getaddrinfo 不报错、
+                               连不上时报 ENETUNREACH，把 App 的「DNS 解析器」改成 DoH 即可绕过。
+        """
+        try:
+            domain = self._effective_domain()
+            if not domain:
+                return
+            host = "%s.%s" % (self._labels().get(1, "?"), domain)
+            addrs, err = system_addrs(host, 443)
+            if addrs:
+                self.log("DNS 自检：%s -> %s" % (host, ", ".join(addrs[:4])))
+            else:
+                self.log("DNS 自检：%s 解析失败（%s）；已在用 App 的「DNS 解析器」，"
+                         "可把它改成任一 DoH 项以绕过本机 DNS" % (host, err))
+        except Exception:
+            pass
+
     def _apply_config(self):
         self._salt_cache = None
         port_raw = self.get_setting("listen_port", str(DEFAULT_PORT))
@@ -1167,6 +1508,11 @@ class WsProxyPlugin(BasePlugin):
             self.log("子域名(DC1-5)：%s" % "  ".join(
                 "%s.%s" % (labels[dc], domain) for dc in (1, 2, 3, 4, 5)))
             self.log("提示：设置页「复制 DNS 记录到剪贴板」可直接复制完整记录")
+            # 后台线程做一次解析自检：getaddrinfo 没有超时参数，绝不能卡住插件队列
+            try:
+                threading.Thread(target=self._log_dns_selfcheck, daemon=True).start()
+            except Exception:
+                pass
         else:
             self.log("「域名」尚未填写：代理不会启动，请先填你自己的域名")
 

@@ -290,5 +290,281 @@ print("settings rows built through the tolerant item(): %d" % guarded)
 assert guarded >= 10, "设置项应统一走 item() 兜底，实际 %d" % guarded
 assert "subtext" not in SDK_SIGNATURES["Selector"], "Selector 依旧不能有 subtext"
 
+# --- 5. 域名解析链 / 失败日志限流（v1.3.16 起；v1.3.19 改为用宿主自带解析器） --
+# 真机日志里 "[Errno 7] No address associated with hostname" 重复了 18666 次，
+# 把日志刷爆且看不出原因。这节守护：
+#   ① 优先用宿主自带的 DNS 选择器（Nekogram DnsFactory），系统 DNS 只做兜底；
+#   ② 同一条失败不会无限刷屏，被压掉的条数会在下一行汇总。
+# v1.3.19 起插件不再自带 DoH 实现——App 的「DNS 解析器」本来就有 DoH。
+_f5 = []
+
+
+class _FakeSock(object):
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+_real_create_connection = m.socket.create_connection
+_real_gai = m.socket.getaddrinfo
+_real_factory = m._DnsFactory
+
+
+def _flash(*a, **k):
+    raise socket.gaierror(7, "No address associated with hostname")
+
+
+# 5a. 宿主没有 DnsFactory 时必须安全降级（返回空列表，不能抛）
+m._DnsFactory = None
+m._app_dns_cache.clear()
+_ok = m.app_dns_lookup("none.example.com", wait=0.3) == []
+_f5.append(("宿主无 DnsFactory 时安全降级", _ok, None))
+
+# 5b. 系统 DNS 正常时按 IP 直连
+m._DnsFactory = None
+m._best_addr.clear()
+m._app_dns_cache.clear()
+_seen0 = []
+m.socket.getaddrinfo = lambda *a, **k: [
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.9", 443))]
+m.socket.create_connection = lambda addr, timeout=None: (_seen0.append(addr), _FakeSock())[1]
+try:
+    m.dial_tcp("ok.example.com", 443, 3.0)
+    _ok = _seen0 == [("198.51.100.9", 443)] and m.LAST_RESOLVE_SOURCE == "dns"
+finally:
+    m.socket.create_connection = _real_create_connection
+    m.socket.getaddrinfo = _real_gai
+_f5.append(("系统 DNS 正常时直连", _ok, _seen0))
+
+# 5c. 完全没有解析结果时抛 gaierror（上层据此归为 resolve）
+m._DnsFactory = None
+m._best_addr.clear()
+m._app_dns_cache.clear()
+m.socket.getaddrinfo = _flash
+m.socket.create_connection = lambda addr, timeout=None: _FakeSock()
+try:
+    try:
+        m.dial_tcp("unresolvable.example.com", 443, 3.0)
+        _ok = False
+    except socket.gaierror:
+        _ok = True
+    except Exception:
+        _ok = False
+finally:
+    m.socket.create_connection = _real_create_connection
+    m.socket.getaddrinfo = _real_gai
+_f5.append(("解析全失败时抛 gaierror", _ok, None))
+
+# 5d. system_addrs 必须把 IPv4 排在 IPv6 前面
+#     实测机型是 IPv4-only（tgnet 全程 ipv6:0），IPv6 排前面会白撞一次 ENETUNREACH。
+m.socket.getaddrinfo = lambda *a, **k: [
+    (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0)),
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.9", 443))]
+try:
+    _addrs, _e = m.system_addrs("order.example.com", 443)
+finally:
+    m.socket.getaddrinfo = _real_gai
+_f5.append(("IPv4 排在 IPv6 前面", _addrs == ["198.51.100.9", "2001:db8::1"] and _e is None, _addrs))
+
+# 5e. App 自带解析器给出的地址优先于系统 DNS
+class _FakeInet(object):
+    def __init__(self, ip):
+        self._ip = ip
+
+    def getHostAddress(self):
+        return self._ip
+
+
+class _FakeDnsFactory(object):
+    def __init__(self, ips):
+        self.ips = ips
+        self.calls = 0
+
+    def lookup(self, host, fallback):
+        self.calls += 1
+        return [_FakeInet(x) for x in self.ips]
+
+
+_fake = _FakeDnsFactory(["198.51.100.77"])
+m._DnsFactory = _fake
+m._best_addr.clear()
+m._app_dns_cache.clear()
+_seen1 = []
+m.socket.getaddrinfo = lambda *a, **k: [
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.1", 443))]
+m.socket.create_connection = lambda addr, timeout=None: (_seen1.append(addr), _FakeSock())[1]
+try:
+    m.dial_tcp("order2.example.com", 443, 3.0)
+    _ok = _seen1 == [("198.51.100.77", 443)] and m.LAST_RESOLVE_SOURCE == "appdns"
+finally:
+    m.socket.create_connection = _real_create_connection
+    m.socket.getaddrinfo = _real_gai
+_f5.append(("App 解析器地址优先于系统 DNS", _ok, _seen1))
+
+# 5f. App 解析器给的地址连不上 -> 回退系统 DNS 仍能成功
+m._best_addr.clear()
+m._app_dns_cache.clear()
+_seen2 = []
+
+
+def _cc_mixed(addr, timeout=None):
+    _seen2.append(addr)
+    if addr[0] == "198.51.100.77":
+        raise OSError(101, "Network is unreachable")
+    return _FakeSock()
+
+
+m.socket.getaddrinfo = lambda *a, **k: [
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.8", 443))]
+m.socket.create_connection = _cc_mixed
+try:
+    m.dial_tcp("fallback.example.com", 443, 3.0)
+    _ok = _seen2 == [("198.51.100.77", 443), ("203.0.113.8", 443)]
+finally:
+    m.socket.create_connection = _real_create_connection
+    m.socket.getaddrinfo = _real_gai
+_f5.append(("App 解析器地址连不上时回退系统 DNS", _ok, _seen2))
+
+# 5g. App 解析结果会被插件缓存（同一个 host 第二次不再调 Java）
+m._app_dns_cache.clear()
+_calls_before = _fake.calls
+m.app_dns_lookup("cached.example.com", wait=0.5)
+_after_first = _fake.calls
+m.app_dns_lookup("cached.example.com", wait=0.5)
+_f5.append(("App 解析结果走缓存",
+            _after_first == _calls_before + 1 and _fake.calls == _after_first,
+            _fake.calls - _calls_before))
+m._DnsFactory = _real_factory
+
+# 5h. 连通过的地址会被缓存，后续拨号不再解析
+_f5.append(("记住连通的地址", m._cached_addr("fallback.example.com") == "203.0.113.8",
+            m._cached_addr("fallback.example.com")))
+
+# 5i. 地址不可路由时，每个地址的错误都要写进 LAST_DIAL_TRACE（诊断的关键）
+m._DnsFactory = None
+m._best_addr.clear()
+m._app_dns_cache.clear()
+m.socket.getaddrinfo = lambda *a, **k: [
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("31.13.1.1", 443))]
+
+
+def _cc_polluted(addr, timeout=None):
+    raise OSError(101, "Network is unreachable")
+
+
+m.socket.create_connection = _cc_polluted
+try:
+    try:
+        m.dial_tcp("polluted.example.com", 443, 3.0)
+    except OSError:
+        pass
+    _ok = "31.13.1.1" in m.LAST_DIAL_TRACE and "unreachable" in m.LAST_DIAL_TRACE.lower()
+finally:
+    m.socket.create_connection = _real_create_connection
+    m.socket.getaddrinfo = _real_gai
+m._DnsFactory = _real_factory
+_f5.append(("不可路由地址记进 LAST_DIAL_TRACE", _ok, m.LAST_DIAL_TRACE))
+
+# 5k. unreachable_hint 要认出 ENETUNREACH（否则会被误当成 DNS 问题）
+_ok = (m.unreachable_hint(OSError(101, "Network is unreachable"))
+       and m.unreachable_hint(OSError(113, "No route to host"))
+       and not m.unreachable_hint(socket.gaierror(7, "No address associated with hostname")))
+_f5.append(("ENETUNREACH 识别", _ok, None))
+
+# 5l. SSLContext 必须复用（每次 create_default_context() 都要重解析整份 CA 库）
+_c1 = m.tls_context(False)
+_c2 = m.tls_context(False)
+_c3 = m.tls_context(True)
+_ok = _c1 is _c2 and _c3 is not _c1 and m.tls_context(True) is _c3
+_f5.append(("SSLContext 复用", _ok, type(_c1).__name__))
+
+# 5o. 建连时开了 TCP_NODELAY（MTProto 全是小包，Nagle 会白攒 40ms）
+_opts = []
+
+
+class _SockOpt(_FakeSock):
+    def setsockopt(self, *a):
+        _opts.append(a)
+
+
+m._best_addr.clear()
+m._app_dns_cache.clear()
+m.socket.getaddrinfo = lambda *a, **k: [
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.5", 443))]
+m.socket.create_connection = lambda addr, timeout=None: _SockOpt()
+try:
+    m.dial_tcp("nodelay.example.com", 443, 3.0)
+    _ok = any(o[0] == socket.IPPROTO_TCP and o[1] == socket.TCP_NODELAY for o in _opts)
+finally:
+    m.socket.create_connection = _real_create_connection
+    m.socket.getaddrinfo = _real_gai
+_f5.append(("建连开 TCP_NODELAY", _ok, _opts))
+
+# 5p. 隧道关闭日志限流
+_clogs = []
+_relay2 = m.Relay(lambda msg: _clogs.append(msg))
+for _ in range(4):
+    _relay2._log_tunnel_close("t.example.com", "unexpected eof", 1.0, 10, 20, "")
+_ok = len(_clogs) == 1
+_f5.append(("隧道关闭日志限流（4 次记 1 条）", _ok, len(_clogs)))
+
+# 5f. 失败分类
+_ok = (m.Relay._dial_error_kind(socket.gaierror(7, "No address associated with hostname")) == "resolve"
+       and m.Relay._dial_error_kind(socket.timeout("timed out")) == "timeout"
+       and m.Relay._dial_error_kind(m.WsError("handshake rejected: HTTP 403")) == "other")
+_f5.append(("失败原因分类", _ok, None))
+
+# 5g. 限流：60 秒内同一条失败只记一次，且下一行汇总被压掉的条数
+_logs = []
+_relay = m.Relay(lambda msg: _logs.append(msg))
+_ge = socket.gaierror(7, "No address associated with hostname")
+for _ in range(5):
+    _relay._log_dial_failure("h.example.com", _ge)
+_ok = len(_logs) == 2 and _relay.dial_failures == 5
+_f5.append(("失败日志限流（5 次只记 1 条）", _ok, len(_logs)))
+
+_logs[:] = []
+_relay._fail_log[("h.example.com", "resolve")] = (0.0, 4)   # 假装已过限流窗口
+_relay._log_dial_failure("h.example.com", _ge)
+_ok = len(_logs) == 2 and any("略过 4 条" in x for x in _logs)
+_f5.append(("恢复记录时汇总被压掉的条数", _ok, _logs[0] if _logs else None))
+
+print()
+for _name, _ok, _extra in _f5:
+    print("  %s  %s%s" % ("ok  " if _ok else "FAIL", _name,
+                          "" if _extra is None else "  -> %r" % (_extra,)))
+_bad5 = [x for x in _f5 if not x[1]]
+print("dns fallback + failure throttling: %s (%d/%d)" %
+      ("PASS" if not _bad5 else "FAIL", len(_f5) - len(_bad5), len(_f5)))
+if _bad5:
+    sys.exit(1)
+
+# --- 6. 端口释放：stop() 后必须能立刻重新 start()（v1.3.20 修的真机 EADDRINUSE） --
+# 真机日志：tcp2ws stopped 之后紧接着 bind 127.0.0.1:6356 failed: Address already in use，
+# 表现就是「关掉代理再打开，它没起来」。这里用真实 socket 复现 start/stop/start。
+_r6 = m.Relay(lambda msg: None)
+_r6.configure("port.example.com", True, m.DEFAULT_CONN_HASH, "ua", False, 46356)
+_ok_a = _r6.start()
+_t6 = _r6._accept_thread
+_r6.stop()
+_ok_stop = (_t6 is not None and not _t6.is_alive())   # stop() 必须等到 accept 线程真正退出
+_ok_b = _r6.start()
+_r6.stop()
+_ok6 = _ok_a and _ok_stop and _ok_b
+print("port release (start/stop:accept-joined/start): %s" % ("PASS" if _ok6 else "FAIL"))
+if not _ok6:
+    sys.exit(1)
+
+# 拨号失败要清掉那条缓存地址，避免下一次又先撞它一次
+m._best_addr.clear()
+m._remember_addr("forget.example.com", "203.0.113.99")
+m._forget_addr("forget.example.com", "203.0.113.99")
+_ok = m._cached_addr("forget.example.com") is None
+print("forget dead cached addr: %s" % ("PASS" if _ok else "FAIL"))
+if not _ok:
+    sys.exit(1)
+
 print()
 print("done")
