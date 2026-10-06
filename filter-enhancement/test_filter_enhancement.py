@@ -122,6 +122,7 @@ def test_latest():
     tables = string_tables(tree)
     check("中英字符串表齐全", set(tables) == {"zh", "en"})
     check("中英键一致", tables.get("zh", set()) == tables.get("en", set()))
+    check("文本行点按提示键存在", "touch_hint" in tables.get("zh", set()))
 
     # 核心回归：setResult 不允许出现裸 int / 裸 bool（v1.0.0 空白页根因）
     bad = []
@@ -636,41 +637,50 @@ def test_v105_wiring():
     check("v1.0.5 含不可点击修复", "setClickable(False)" in src)
 
 
-def test_v106_no_dead_text_rows():
-    print("== v1.0.6 删除设置页里点不动的文本行（无效的文本按钮）==")
+def test_v106_text_rows_clickable():
+    print("== v1.0.6 设置页文本行可点击（无效的文本按钮）==")
     src, tree = parse(PLUGIN_PATH)
 
-    # 宿主 SDK 的 ui.settings.Text 只是个标签、不派发点击（同仓库的 ws-proxy
-    # v1.3.13 起也已彻底不用它）：它在设置页里看着像按钮，点下去什么都不会发生。
-    # 既然修不了，就按「不能修就直接删掉」删干净，并顺手去掉 Text 的导入。
-    imported = set()
+    method_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    check("含 _show_text_dialog", "_show_text_dialog" in method_names)
+    check("含 _context_from_args", "_context_from_args" in method_names)
+    check("含 _health_text", "_health_text" in method_names)
+    check("含 _diag_text", "_diag_text" in method_names)
+
+    # create_settings 里的每个 Text 行都必须带 on_click：宿主
+    # PluginSettingsActivity.onClick 只在 Text 有 onClickCallback 时才会派发
+    # （textSetting.onClickCallback.call(view)）。缺了 on_click，这一行就是
+    # v1.0.5 及更早的"看着像按钮、点下去什么都没有"的死行。
+    create = None
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "ui.settings":
-            imported = {a.name for a in node.names}
-    check("不再导入 ui.settings.Text", "Text" not in imported)
-    check("仍导入 Header/Divider/Switch", {"Header", "Divider", "Switch"} <= imported)
+        if isinstance(node, ast.FunctionDef) and node.name == "create_settings":
+            create = node
+    check("定位 create_settings", create is not None)
+    rows = []
+    if create is not None:
+        for n in ast.walk(create):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "Text":
+                rows.append(n)
+    check("设置页含 3 个文本行", len(rows) == 3)
+    for n in rows:
+        kw = {k.arg for k in n.keywords}
+        check("文本行 line %d 带 on_click" % n.lineno, "on_click" in kw)
+        check("文本行 line %d 标记为可点样式 accent" % n.lineno, "accent" in kw)
+        sub = ""
+        for k in n.keywords:
+            if k.arg == "subtext":
+                sub = ast.get_source_segment(src, k.value) or ""
+        check("文本行 line %d 带点按提示" % n.lineno, "touch_hint" in sub)
 
-    text_calls = [n for n in ast.walk(tree)
-                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                  and n.func.id == "Text"]
-    check("设置页已无 Text 行", not text_calls)
+    # 弹窗走宿主 SDK 的 AlertDialogBuilder（与长按「过滤原因」同一条路径）
+    check("文本行弹窗使用 AlertDialogBuilder", "AlertDialogBuilder(context)" in src)
 
-    tables = string_tables(tree)
-    dead = {"set_note", "set_note_about", "set_health", "set_health_ok",
-            "set_health_bad", "set_diag", "set_diag_text", "set_diag_yes",
-            "set_diag_no"}
-    check("已删除不再被引用的文案键", not (dead & tables.get("zh", set())))
-    check("中英键仍然一致", tables.get("zh", set()) == tables.get("en", set()))
-
-    # 信息不能凭空消失：打开设置页时把钩子状态与诊断计数写进插件日志
-    check("打开设置页时输出状态日志", "settings opened: hooks" in src)
-
-    # 版本演化：v1.0.5 仍带文本行（历史保真），v1.0.6 必须已删干净
+    # 版本演化：v1.0.5 没有这套修复，v1.0.6 必须有
     v105 = os.path.join(VERSIONS_DIR, "v1.0.5", "filter_enhancement.plugin")
     if os.path.isfile(v105):
         src105, _ = parse(v105)
-        check("v1.0.5 仍含文本行（历史保真）", "Text(text=tr(\"set_note\")" in src105)
-    check("v1.0.6 已无 Text 行", "Text(text=tr(" not in src)
+        check("v1.0.5 不含文本行点击修复（历史保真）", "_show_text_dialog" not in src105)
+    check("v1.0.6 含文本行点击修复", "_show_text_dialog" in src)
 
 
 def main():
@@ -681,7 +691,7 @@ def main():
     test_v104_wiring()
     test_v105_row_must_stay_non_clickable()
     test_v105_wiring()
-    test_v106_no_dead_text_rows()
+    test_v106_text_rows_clickable()
     print("\n通过 %d 项，失败 %d 项。" % (PASSED[0], FAILED[0]))
     return 1 if FAILED[0] else 0
 

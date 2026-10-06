@@ -21,12 +21,13 @@ Feature parity with the original Java patch:
      now also posts NotificationCenter.regexFiltersUpdated).
   8. The upstream shadow-ban peer-chain hide (via_bot / fwd_from chains) is disabled,
      matching the enhancement's removal of isShadowBannedPeerChain; a switch restores it.
-  9. v1.0.6 removed the three informational rows that used to sit at the bottom of
-     the settings page. The host SDK's ui.settings.Text is a label that never
-     dispatches clicks, so those rows looked exactly like settings buttons but did
-     nothing when tapped ("无效的文本按钮") — unfixable, therefore deleted, exactly
-     as ws_proxy v1.3.13 dropped Text. Hook status / diagnostics now go to the
-     plugin log when the settings page is built.
+  9. v1.0.6: the three informational rows at the bottom of the settings page (About /
+     Hook status / Interaction diagnostics) are tappable and open their full text in a
+     dialog. Before v1.0.6 they carried no on_click, and a ui.settings.Text without
+     on_click is a dead row: it looks exactly like a settings button but a tap does
+     nothing at all ("无效的文本按钮"). The host does dispatch the callback
+     (PluginSettingsActivity.onClick -> textSetting.onClickCallback.call(view)), so the
+     rows are fixable and did not have to be removed.
 
 The plugin only hooks Java methods (Xposed-style, via the host's PyMethodHook);
 it ships no Java code and adds no resources. All placeholder strings are bundled
@@ -71,7 +72,7 @@ from android_utils import (
     OnLongClickListener,
     R,
 )
-from ui.settings import Header, Divider, Switch
+from ui.settings import Header, Divider, Switch, Text
 from ui.alert import AlertDialogBuilder
 
 # ---------------------------------------------------------------------------
@@ -84,6 +85,7 @@ NotificationCenter = jclass("org.telegram.messenger.NotificationCenter")
 UserConfig = jclass("org.telegram.messenger.UserConfig")
 LocaleController = jclass("org.telegram.messenger.LocaleController")
 AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
 Theme = jclass("org.telegram.ui.ActionBar.Theme")
 LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
 RecyclerListViewHolder = jclass("org.telegram.ui.Components.RecyclerListView$Holder")
@@ -125,6 +127,19 @@ _STRINGS = {
         "set_webpage_about": "将链接预览（URL、站点名、标题、简介）纳入正则匹配范围，使针对预览内链接的规则能够命中。",
         "set_shadow": "恢复链式屏蔽（上游行为）",
         "set_shadow_about": "开启后恢复上游的 shadow-ban 链式隐藏（via_bot / 转发来源链）。默认关闭，与过滤器增强补丁行为一致。",
+        "set_note": "说明",
+        "set_note_about": "本插件是 ljili1/NagramXF「过滤器增强」补丁的插件化移植。过滤规则本身仍在 Nagram 设置 → 过滤器 中维护；本插件提供占位条、点击恢复、过滤原因、链接预览匹配与即时刷新等增强行为。",
+        "set_health": "钩子状态",
+        "set_health_ok": "%d/%d 已安装",
+        "set_health_bad": "%d/%d 已安装（存在缺失，部分功能已降级；请反馈宿主版本号）",
+        "set_diag": "交互诊断",
+        "set_diag_text": ("菜单钩子：%s；列表监听器钩子：%s\n"
+                          "钩子被调用：菜单 %d、监听器 %d\n"
+                          "占位条：创建 %d、绑定 %d\n"
+                          "命中：点击 %d、长按 %d"),
+        "set_diag_yes": "已安装",
+        "set_diag_no": "未安装",
+        "touch_hint": "（点按查看完整内容）",
     },
     "en": {
         "hint": "Hidden by the filter. Tap to show.",
@@ -144,6 +159,19 @@ _STRINGS = {
         "set_webpage_about": "Include link preview fields (URL, site name, title, description) in regex matching so rules targeting preview-only links can hit.",
         "set_shadow": "Restore shadow-ban chain (upstream)",
         "set_shadow_about": "Re-enables the upstream shadow-ban peer-chain hiding (via_bot / forward-source chains). Off matches the filter-enhancement patch.",
+        "set_note": "About",
+        "set_note_about": "Plugin port of the ljili1/NagramXF filter-enhancement patch. Filter rules themselves are still managed under Nagram Settings > Filters; this plugin adds placeholders, tap-to-reveal, filter reasons, link-preview matching and instant refresh.",
+        "set_health": "Hook status",
+        "set_health_ok": "%d/%d installed",
+        "set_health_bad": "%d/%d installed (some missing, features degraded; please report your host version)",
+        "set_diag": "Interaction diagnostics",
+        "set_diag_text": ("Menu hook: %s; list-listener hook: %s\n"
+                          "Hook invocations: menu %d, listener %d\n"
+                          "Placeholders: created %d, bound %d\n"
+                          "Handled: taps %d, long-presses %d"),
+        "set_diag_yes": "installed",
+        "set_diag_no": "not installed",
+        "touch_hint": " (tap for the full text)",
     },
 }
 
@@ -214,20 +242,6 @@ class FilterEnhancementPlugin(BasePlugin):
     # ------------------------------------------------------------------
     def create_settings(self):
         tr = self._tr
-        # v1.0.6: the host's ui.settings.Text is a label that never dispatches
-        # clicks, so the three informational rows that used to sit at the bottom
-        # of this page looked like settings buttons yet did nothing when tapped.
-        # They are gone (ws_proxy v1.3.13 dropped Text for the same reason); the
-        # state they used to show is dumped to the plugin log instead, so opening
-        # this page is enough to capture it in a bug report.
-        try:
-            log("settings opened: hooks %d/%d; menu_calls=%d listener_calls=%d "
-                "created=%d bound=%d taps=%d longs=%d"
-                % (self._hooks_ok, self._hooks_total, self._diag["menu_calls"],
-                   self._diag["listener_calls"], self._diag["created"],
-                   self._diag["bound"], self._diag["taps"], self._diag["longs"]))
-        except Exception as e:
-            log("settings status log failed: %s" % e)
         return [
             Header(tr("set_header")),
             Switch(key="placeholder_enabled", text=tr("set_placeholder"), default=True,
@@ -246,7 +260,104 @@ class FilterEnhancementPlugin(BasePlugin):
             Switch(key="shadow_chain_upstream", text=tr("set_shadow"), default=False,
                    subtext=tr("set_shadow_about"),
                    on_change=lambda v: self._on_behavior_setting_changed()),
+            Divider(),
+            Text(text=tr("set_note"),
+                 subtext=tr("set_note_about") + tr("touch_hint"),
+                 accent=True,
+                 on_click=lambda *a: self._show_text_dialog(
+                     tr("set_note"), tr("set_note_about"), a)),
+            Text(text=tr("set_health"),
+                 subtext=self._health_text() + tr("touch_hint"),
+                 accent=True,
+                 red=self._hooks_ok < self._hooks_total,
+                 on_click=lambda *a: self._show_text_dialog(
+                     tr("set_health"), self._health_text(), a)),
+            Text(text=tr("set_diag"),
+                 subtext=self._diag_text() + tr("touch_hint"),
+                 accent=True,
+                 red=not (self._menu_hook_ok or self._listener_hooks_done),
+                 on_click=lambda *a: self._show_text_dialog(
+                     tr("set_diag"), self._diag_text(), a)),
         ]
+
+    def _health_text(self):
+        """Full hook-install status. Shared by the settings row and by the row's
+        tap dialog so the two can never drift apart (v1.0.6)."""
+        tr = self._tr
+        if self._hooks_ok >= self._hooks_total:
+            return tr("set_health_ok") % (self._hooks_ok, self._hooks_total)
+        return tr("set_health_bad") % (self._hooks_ok, self._hooks_total)
+
+    def _diag_text(self):
+        """Full interaction diagnostics: exactly what the settings row shows."""
+        tr = self._tr
+        return tr("set_diag_text") % (
+            tr("set_diag_yes") if self._menu_hook_ok else tr("set_diag_no"),
+            tr("set_diag_yes") if self._listener_hooks_done else tr("set_diag_no"),
+            self._diag["menu_calls"], self._diag["listener_calls"],
+            self._diag["created"], self._diag["bound"],
+            self._diag["taps"], self._diag["longs"])
+
+    # ------------------------------------------------------------------
+    # settings info rows: a tap opens the full text
+    #
+    # 宿主 SettingsItem 里的 Text 只有在带 on_click 时才可点：PluginSettingsActivity
+    # 的 onClick 会调用 textSetting.onClickCallback.call(view)（紧跟
+    # createSubFragmentCallback 分支之后）。没有 on_click 的 Text 就是一行"看着像
+    # 按钮、点下去什么都没有"的死行 —— 这正是 v1.0.6 修的问题。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _context_from_args(args):
+        """Best-effort Context for a settings-row tap.
+
+        The host passes the clicked View (textSetting.onClickCallback.call(view)),
+        but older builds passed the fragment or nothing at all, so accept all of
+        them and fall back to ApplicationLoader.applicationContext, which needs no
+        Activity.
+        """
+        for a in (args or ()):
+            if a is None:
+                continue
+            for name in ("getContext", "getParentActivity"):
+                try:
+                    fn = getattr(a, name, None)
+                    ctx = fn() if fn is not None else None
+                    if ctx is not None:
+                        return ctx
+                except Exception:
+                    pass
+            for name in ("context", "mContext", "getBaseContext"):
+                try:
+                    ctx = getattr(a, name, None)
+                    if callable(ctx):
+                        ctx = ctx()
+                    if ctx is not None:
+                        return ctx
+                except Exception:
+                    pass
+        try:
+            return ApplicationLoader.applicationContext
+        except Exception:
+            return None
+
+    def _show_text_dialog(self, title, message, args=None):
+        """Open the full text of an informational settings row.
+
+        v1.0.6: these three rows used to be dead — they look like every other
+        settings row but carried no on_click, so a tap did nothing at all.
+        """
+        try:
+            context = self._context_from_args(args)
+            if context is None:
+                log("%s: %s" % (title, message))
+                return
+            (AlertDialogBuilder(context)
+             .set_title(title)
+             .set_message(message)
+             .set_positive_button(get_string("OK"), None)
+             .show())
+        except Exception as e:
+            log("settings info row failed: %s" % e)
 
     def _on_behavior_setting_changed(self):
         # Filter verdicts / view types depend on these; invalidate + refresh open chats.
