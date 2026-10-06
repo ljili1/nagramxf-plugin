@@ -1,15 +1,6 @@
 # -*- coding: utf-8 -*-
-"""ws_proxy.plugin 本地验证脚本（CPython，不依赖 Android 运行时）。
-
-直接运行：python test_ws_proxy.py
-1.3.6 起插件不再内置公共域名（DEFAULT_DOMAIN 已删除），测试自备 example.com。
-1.3.1 起新增「派生标签」相关断言（derive_label / build_labels / build_routes(domain, labels)），
-兼容标签（pluto/venus/...）的旧断言保持原样，用于守护默认行为不被改坏。
-"""
-import ast
+"""ws_proxy.plugin 本地验证脚本（CPython，不依赖 Android 运行时）。"""
 import importlib.util
-import os
-import re
 import socket
 import struct
 import sys
@@ -17,20 +8,16 @@ import threading
 import time
 from importlib.machinery import SourceFileLoader
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PLUGIN = os.path.join(_HERE, "ws_proxy.plugin")
-if not os.path.exists(_PLUGIN):
-    _PLUGIN = os.path.join(_HERE, "ws-proxy", "ws_proxy.plugin")
-
 spec = importlib.util.spec_from_loader(
-    "ws_proxy", SourceFileLoader("ws_proxy", _PLUGIN))
+    "ws_proxy",
+    SourceFileLoader("ws_proxy", r"D:/WorkBuddyproject/ws/ws-proxy-plugin/ws_proxy.plugin"))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
-DOMAIN = "example.com"   # 插件已不再内置公共域名，测试自备一个
+DOMAIN = m.DEFAULT_DOMAIN
 table, p6 = m.build_routes(DOMAIN)
 
-# --- 1. 路由表断言（默认 = 兼容标签） ---------------------------------------
+# --- 1. 路由表断言 -----------------------------------------------------------
 # (地址, 期望子域)；权威地址取自 Nullgram docs/wsproxy/records.txt
 CASES = [
     ("149.154.175.50", "pluto"), ("149.154.167.51", "venus"),
@@ -84,40 +71,8 @@ print("route table: %s (%d failures)" % ("PASS" if fails == 0 else "FAIL", fails
 if fails:
     sys.exit(1)
 
-# --- 1a. 派生标签（1.3.0） --------------------------------------------------
-LABEL_RE = re.compile(r"^[a-z][a-z2-7]{11}$")
-DOMAIN2 = "example.com"
-SALT = "unit-test-salt"
-
-labels = m.build_labels(DOMAIN2, 0, SALT)
-assert set(labels) == set(m.LABEL_DOMAIN_DCS), labels
-for dc, name in sorted(labels.items()):
-    assert LABEL_RE.match(name), "非法 DNS 标签 %r (dc=%s)" % (name, dc)
-assert len(set(labels.values())) == len(labels), "各 DC 标签必须互不相同"
-assert m.build_labels(DOMAIN2, 0, SALT) == labels, "同 (域名,盐值) 必须确定性"
-assert m.build_labels(DOMAIN2, 0, "other-salt") != labels, "换盐值必须换整套标签"
-assert m.build_labels("example.net", 0, SALT) != labels, "换域名必须换整套标签"
-# 盐值留空 = 只按域名派生，必须确定性（1.3.1 修掉了随机盐导致的标签漂移）
-assert m.build_labels(DOMAIN2, 0, "") == m.build_labels(DOMAIN2, 0, ""), "空盐值也必须确定性"
-assert m.build_labels(DOMAIN2, 0, "") != labels, "填盐值应换出另一套标签"
-assert m.build_labels(DOMAIN2, 1) == dict(m.LEGACY_LABELS), "兼容模式必须等于固定旧名"
-# 跨实现交叉校验：同一算法由独立实现算得的已知答案
-assert m.derive_label(DOMAIN2, 1, "saltA") == "gi74vwhmajpd", m.derive_label(DOMAIN2, 1, "saltA")
-# 自定义模式：按 DC1..DC5[,...] 顺序；未填的 DC 自动用派生值补齐；非法字符被清洗
-custom = m.build_labels(DOMAIN2, 2, "", "aa1, bb2, cc3, dd4, ee5")
-assert [custom[d] for d in (1, 2, 3, 4, 5)] == ["aa1", "bb2", "cc3", "dd4", "ee5"], custom
-assert LABEL_RE.match(custom[17]), custom[17]
-assert m.build_labels(DOMAIN2, 2, "", "UP.per!, B2")[1] == "upper", "应小写并清洗非法字符"
-# 派生标签必须真的被路由表用上（含 IPv6 /64 回退与拒绝路径）
-table2, p62 = m.build_routes(DOMAIN2, labels)
-assert m.lookup_server("149.154.175.50", table2, p62) == labels[1] + "." + DOMAIN2
-assert m.lookup_server("149.154.167.91", table2, p62) == labels[4] + "." + DOMAIN2
-assert m.lookup_server("2001:67c:4e8:f004::b", table2, p62) == labels[4] + "." + DOMAIN2
-assert m.lookup_server("149.154.175.40", table2, p62) == labels[17] + "." + DOMAIN2
-assert m.lookup_server("8.8.8.8", table2, p62) is None
-print("derived labels: PASS (DC1=%s, DC4=%s)" % (labels[1], labels[4]))
-
-# --- 1b. 纯 Python AES-256-CTR 与 obfs2 入向解码 -----------------------------
+# --- 1b. 纯 Python AES-256-CTR 与 obfs2 入向解码 ------------------------------
+import os
 # FIPS-197 附录 C.3 AES-256 测试向量
 _rk = m._aes256_expand_key(bytes(range(32)))
 _vec = m._aes_encrypt_block(
@@ -228,67 +183,6 @@ if sock is not None:
         relay.stop()
 else:
     print("socks5 chain: SKIP（握手未完成，无法做全链路）")
-
-# --- 4. 设置页关键字必须与宿主 SDK 签名一致（v1.3.15 修掉的崩溃类型） --------
-# 宿主的 PythonPluginsEngine.loadPluginSettings() 反射构造这些 dataclass：只要
-# 传了签名里没有的关键字就抛 TypeError，而该异常会终结整页设置加载，真机日志：
-#   E/PythonPluginsEngine: Failed to load plugin settings
-#   com.chaquo.python.PyException: TypeError:
-#       Selector.__init__() got an unexpected keyword argument 'subtext'
-# 根因：Selector 有 key/text/default/items/icon/on_change/on_long_click/
-# link_alias，但**没有 subtext**（Switch / Input / Text 才有）。这里把宿主 SDK
-# 的字段表固化成断言，防止再次把 subtext 塞给 Selector。
-SDK_SIGNATURES = {
-    "Header": {"text"},
-    "Divider": {"text"},
-    "Switch": {"key", "text", "default", "subtext", "icon", "on_change",
-               "on_long_click", "link_alias"},
-    "Selector": {"key", "text", "default", "items", "icon", "on_change",
-                 "on_long_click", "link_alias"},
-    "Input": {"key", "text", "default", "subtext", "icon", "on_change",
-              "on_long_click", "link_alias"},
-    "Text": {"text", "subtext", "icon", "accent", "red", "on_click",
-             "on_long_click", "create_sub_fragment", "link_alias"},
-    "EditText": {"key", "hint", "default", "multiline", "max_length", "mask",
-                 "on_change"},
-    "Custom": {"item", "view", "factory", "factory_args", "on_click",
-               "on_long_click", "create_sub_fragment", "link_alias"},
-}
-
-_src = open(_PLUGIN, encoding="utf-8").read()
-_tree = ast.parse(_src)
-sig_fails = []
-guarded = 0
-selector_direct = 0
-for _node in ast.walk(_tree):
-    if not isinstance(_node, ast.Call) or not isinstance(_node.func, ast.Name):
-        continue
-    _fname = _node.func.id
-    _kws = {k.arg for k in _node.keywords if k.arg}
-    if _fname in SDK_SIGNATURES:
-        if _fname == "Selector":
-            selector_direct += 1
-        _bad = _kws - SDK_SIGNATURES[_fname]
-        if _bad:
-            sig_fails.append((_node.lineno, _fname, sorted(_bad)))
-    elif _fname == "item" and _node.args and isinstance(_node.args[0], ast.Name):
-        _target = _node.args[0].id
-        guarded += 1
-        if _target in SDK_SIGNATURES:
-            _bad = _kws - SDK_SIGNATURES[_target]
-            if _bad:
-                sig_fails.append((_node.lineno, _target, sorted(_bad)))
-        else:
-            sig_fails.append((_node.lineno, _target, ["<unknown factory>"]))
-
-print("settings kwargs vs host SDK: %s" % ("PASS" if not sig_fails else "FAIL"))
-for _line, _fname, _bad in sig_fails:
-    print("  FAIL line %d: %s(%s)" % (_line, _fname, ", ".join(_bad)))
-if sig_fails:
-    sys.exit(1)
-print("settings rows built through the tolerant item(): %d" % guarded)
-assert guarded >= 10, "设置项应统一走 item() 兜底，实际 %d" % guarded
-assert "subtext" not in SDK_SIGNATURES["Selector"], "Selector 依旧不能有 subtext"
 
 print()
 print("done")

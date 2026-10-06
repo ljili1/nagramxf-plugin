@@ -1,32 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-WS Proxy —— 让 Telegram 的流量改走 WebSocket(wss)，绕过部分网络的封锁。
-移植自 Nullgram / Nekogram 的 tcp2ws，采用「纯 DNS 模式」：不需要服务器。
+WS Proxy (tcp2ws) — Nullgram 的 WebSocket 代理功能移植为 NagramXF 插件。
 
-三步就能用：
-  1. 「域名」填你自己的域名（必填，例如 example.com）；
-  2. 点一下「复制 DNS 记录到剪贴板」，粘到电脑上存成 .txt，
-     在 Cloudflare 里 Import（勾橙云），
-     再把 Cloudflare 的 SSL/TLS 加密模式设为 Flexible；
-  3. 打开「启用代理」，然后去 Telegram 的代理列表里启用它。
+原理（与 Nullgram 内置实现一致）：
+  1. 在本机 127.0.0.1 起一个 SOCKS5 服务；
+  2. tgnet 拨到哪个 Telegram DC 地址，就按路由表把该地址映射到对应的
+     Cloudflare 子域（pluto/venus/aurora/vesta/flora.<域名>）；
+  3. 与该子域的 /api 建立 WebSocket（wss，子协议 binary），
+     TCP 字节流 <-> WS 二进制帧 双向转发；
+  4. 插件自动向 Telegram 代理列表注册 127.0.0.1:<端口> 的 SOCKS5 代理并启用。
 
-细节（原理、标签派生、路由表、部署与排错）见同目录 README.md。
-依赖：仅 Python 标准库，不需要第三方包。
+路由表来源：qwq233/Nullgram libs/tcp2ws + docs/wsproxy/records.txt，
+并合入了以下修正：
+  - 补 149.154.167.41（dc2 -> venus）精确行；
+  - dc1-dc5 的 IPv6 /64 前缀键（Telegram 会下发同块的 ::b 等未登记主机，
+    真机案例 2001:67c:4e8:f002::b -> venus）；test 精确行仍优先命中；
+  - 查表失败时按 SOCKS5 "Host unreachable" 拒绝（不回退裸 IP：
+    裸 IP 的 wss 因 SNI 问题不可用，拒绝更快且更可诊断）。
+
+依赖：仅 Python 标准库（socket / ssl / threading），不需要第三方包。
 """
 
 __id__ = "ws_proxy"
-__name__ = "WebSocket 代理"
+__name__ = "WS Proxy (tcp2ws)"
 __description__ = (
-    "让 Telegram 的流量改走 WebSocket(wss)，绕过部分网络的封锁。"
-    "纯客户端方案：只需要一个你自己的域名，不需要任何服务器。"
-    "在设置页填好域名、按提示配好 DNS 记录后打开开关即可使用。"
+    "将 Nullgram 的 tcp2ws WebSocket 代理移植为插件："
+    "本机 SOCKS5 -> 按 DC 路由到 Cloudflare 子域 -> wss://<子域>/api。"
+    "默认使用 Nullgram 公共域名，也可填自建域名。"
 )
 __author__ = "ljili (port of qwq233/Nullgram)"
-__version__ = "1.3.15"
+__version__ = "1.2.1"
 
 import base64
-import hashlib
-import hmac
 import ipaddress
 import os
 import socket
@@ -42,7 +47,7 @@ try:
     from java import jclass  # noqa: F401
     from base_plugin import BasePlugin
     from android_utils import log as _alog, run_on_ui_thread
-    from ui.settings import Header, Switch, Selector, Input, Divider
+    from ui.settings import Header, Switch, Selector, Input, Text, Divider
     _IN_HOST = True
 except Exception:  # 本地 CPython 调试
     _IN_HOST = False
@@ -66,133 +71,27 @@ except Exception:  # 本地 CPython 调试
         print(msg)
 
 
-# Xposed 式 hook 能力（宿主提供 base_plugin.XposedHook / hook_utils）。
-# 单独 try：万一某个宿主没有这两个模块，只让"代理列表改名"降级，不影响代理本身。
-try:
-    from base_plugin import XposedHook
-    import hook_utils
-    _HOOKS_OK = True
-except Exception:
-    XposedHook = None
-    hook_utils = None
-    _HOOKS_OK = False
-
-
-# 可选控件与能力：老宿主可能没有 Text / EditText 或 copy_to_clipboard。
-# 单独 try，缺了只让「复制/查看 DNS 记录」这两行降级，不影响整页设置加载。
-try:
-    from ui.settings import Text, EditText
-except Exception:
-    Text = None
-    EditText = None
-
-try:
-    from android_utils import copy_to_clipboard
-except Exception:
-    copy_to_clipboard = None
-
-
 # ---------------------------------------------------------------------------
 # 默认配置（与 Nullgram 内置值一致）
 # ---------------------------------------------------------------------------
-# 「域名」必填：插件会把 Telegram 的 DC 映射到 <子域名>.<你的域名>，没有内置域名。
+DEFAULT_DOMAIN = "ck2ut7v3g5zudnjw.top"
 DEFAULT_CONN_HASH = "381d52f35f552e10ad1701445dba9cd14acb7e43"
 DEFAULT_PORT = 6356
-# 默认 UA：保持 Telegram 客户端风格（上游对未知客户端可能返回 302，可自行修改）。
+# 注意：Nullgram 公共中继的边缘规则要求 User-Agent 含 "Nullgram"，否则 302。
 PLUGIN_UA = "Nullgram 12.0.0 (1200) NagramXF-ws-proxy/1.0.0"
 
-# 经典名：旧 records.txt 里的固定 DC 名（pluto/venus/…），供「经典名」模式使用
-LEGACY_LABELS = {
+# DC -> 子域映射（固定，勿猜）
+DC_SUBDOMAINS = {
     1: "pluto", 2: "venus", 3: "aurora", 4: "vesta", 5: "flora",
     17: "test_pluto", 18: "test_venus", 19: "test_aurora",
-}
-# 向后兼容：旧代码/测试里的 DC_SUBDOMAINS 仍指向兼容标签
-DC_SUBDOMAINS = LEGACY_LABELS
-
-# 标签模式：0=按 域名+盐值 派生（推荐）1=兼容固定名 2=自定义
-LABEL_MODES = ["自动生成（推荐）", "经典名（pluto/venus/…）", "自定义"]
-DERIVED_LABEL_LEN = 12     # 派生标签长度（含首字母），纯 a-z0-9
-LABEL_DOMAIN_DCS = [1, 2, 3, 4, 5, 17, 18, 19]   # 需要标签的 DC；17-19 为测试 DC
-
-# 每个 DC 的权威地址（Nullgram docs/wsproxy/records.txt），用于生成 DNS 记录模板
-DC_RECORDS = {
-    1: ("pluto", ["149.154.175.50"], ["2001:b28:f23d:f001::a"]),
-    2: ("venus", ["95.161.76.100", "149.154.167.51"], ["2001:67c:4e8:f002::a"]),
-    3: ("aurora", ["149.154.175.100"], ["2001:b28:f23d:f003::a"]),
-    4: ("vesta", ["149.154.167.91"], ["2001:67c:4e8:f004::a"]),
-    5: ("flora", ["149.154.171.5"], ["2001:b28:f23f:f005::a"]),
-    17: ("test_pluto", ["149.154.175.40"], ["2001:b28:f23d:f001::e"]),
-    18: ("test_venus", ["149.154.167.40"], ["2001:67c:4e8:f002::e"]),
-    19: ("test_aurora", ["149.154.175.117"], ["2001:b28:f23d:f003::e"]),
 }
 
 
 # ---------------------------------------------------------------------------
 # 路由表
 # ---------------------------------------------------------------------------
-# 标签派生：把「哪个 DC」编码进 Host 首段，但不用固定词汇（去指纹）
-# ---------------------------------------------------------------------------
-_B32_DIGITS = "234567"
-_B32_LETTERS = "abcdef"
-_CUSTOM_LABEL_OK = "abcdefghijklmnopqrstuvwxyz0123456789-"
-
-
-def _label_from_mac(mac, length=DERIVED_LABEL_LEN):
-    """32 字节摘要 -> 小写 base32 截断，首字符强制为字母（DNS 标签要求）。"""
-    body = base64.b32encode(mac).decode("ascii").lower().rstrip("=")[:max(1, int(length))]
-    head = body[0]
-    if head in _B32_DIGITS:
-        head = _B32_LETTERS[_B32_DIGITS.index(head)]
-    return head + body[1:]
-
-
-def derive_label(domain, dc, salt="", length=DERIVED_LABEL_LEN):
-    """由 域名 + 盐值 + DC 确定性派生一个无意义标签。
-
-    同一个 (域名, 盐值) 永远得到同一组标签，所以 DNS 只需配一次。
-    盐值留空时只用域名派生（默认）：不同域名天然不同，且重启/重装都不变；
-    填了盐值则再换一套标签（旧 DNS 记录立即失效，需同步重配）。
-    """
-    key = ("nagramxf-ws-proxy|%s|%s" % (domain or "", salt or "")).encode("utf-8")
-    mac = hmac.new(key, ("dc%d" % dc).encode("ascii"), hashlib.sha256).digest()
-    return _label_from_mac(mac, length)
-
-
-def build_labels(domain, mode=0, salt="", custom=""):
-    """返回 {dc: label}。label 只含 a-z0-9 且首字符为字母，可直接作为 DNS 主机名。"""
-    labels = {}
-    try:
-        mode = int(mode)
-    except Exception:
-        mode = 0
-    if mode == 1:
-        return dict(LEGACY_LABELS)
-    if mode == 2:
-        items = [x.strip().lower() for x in (custom or "").replace(",", " ").split()
-                 if x.strip()]
-        for dc, name in zip(LABEL_DOMAIN_DCS, items):
-            clean = "".join(ch for ch in name if ch in _CUSTOM_LABEL_OK).strip("-")
-            if clean:
-                labels[dc] = clean
-    # 派生模式，或自定义模式下没填够的 DC：一律用派生值补齐
-    used = set(labels.values())
-    for dc in LABEL_DOMAIN_DCS:
-        if dc in labels:
-            continue
-        name = derive_label(domain, dc, salt)
-        bump = 0
-        while name in used:            # 理论上不会发生，纯防御
-            bump += 1
-            name = derive_label(domain, dc, "%s#%d" % (salt, bump))
-        labels[dc] = name
-        used.add(name)
-    return labels
-
-
-def build_routes(domain, labels=None):
+def build_routes(domain):
     """返回 (exact_table, v6_prefix_table)。
-
-    labels: {dc: 子域首段}，缺省用兼容标签（pluto/venus/...）。
 
     exact_table 的键包含两种：
       - 精确主机（IPv4 点分串 / IPv6 压缩串）；
@@ -201,13 +100,9 @@ def build_routes(domain, labels=None):
     v6_prefix_table 对 5 个 DC 的 /64 都放前缀键（test 精确行优先命中）。
     """
     t = {}
-    labels = labels if isinstance(labels, dict) and labels else DC_SUBDOMAINS
-
-    def label_of(dc):
-        return labels.get(dc) or DC_SUBDOMAINS[dc]
 
     def put(key, dc):
-        t[key] = "%s.%s" % (label_of(dc), domain)
+        t[key] = "%s.%s" % (DC_SUBDOMAINS[dc], domain)
 
     def put6(addr, dc):
         put(ipaddress.IPv6Address(addr).compressed, dc)
@@ -263,11 +158,11 @@ def build_routes(domain, labels=None):
     # 真机案例：Telegram 下发 2001:67c:4e8:f002::b（dc2），表内仅有 ::a/::d/::e，
     # 截尾查不到即拒绝，必须靠 /64 回退覆盖。
     p6 = {}
-    p6["2001:b28:f23d:f001"] = "%s.%s" % (label_of(1), domain)   # dc1
-    p6["2001:67c:4e8:f002"] = "%s.%s" % (label_of(2), domain)   # dc2
-    p6["2001:b28:f23d:f003"] = "%s.%s" % (label_of(3), domain)   # dc3
-    p6["2001:67c:4e8:f004"] = "%s.%s" % (label_of(4), domain)   # dc4 独占
-    p6["2001:b28:f23f:f005"] = "%s.%s" % (label_of(5), domain)   # dc5 独占
+    p6["2001:b28:f23d:f001"] = "%s.%s" % (DC_SUBDOMAINS[1], domain)   # dc1
+    p6["2001:67c:4e8:f002"] = "%s.%s" % (DC_SUBDOMAINS[2], domain)   # dc2
+    p6["2001:b28:f23d:f003"] = "%s.%s" % (DC_SUBDOMAINS[3], domain)   # dc3
+    p6["2001:67c:4e8:f004"] = "%s.%s" % (DC_SUBDOMAINS[4], domain)   # dc4 独占
+    p6["2001:b28:f23f:f005"] = "%s.%s" % (DC_SUBDOMAINS[5], domain)   # dc5 独占
 
     return t, p6
 
@@ -615,8 +510,7 @@ class Relay(object):
     def __init__(self, logger):
         self.table = {}
         self.v6_prefix = {}
-        self.domain = ""
-        self.labels = dict(DC_SUBDOMAINS)
+        self.domain = DEFAULT_DOMAIN
         self.use_tls = True
         self.conn_hash = DEFAULT_CONN_HASH
         self.user_agent = PLUGIN_UA
@@ -634,18 +528,15 @@ class Relay(object):
         self.log = logger
 
     # ---- 配置 ----
-    def configure(self, domain, use_tls, conn_hash, user_agent, insecure_tls, port,
-                  labels=None):
+    def configure(self, domain, use_tls, conn_hash, user_agent, insecure_tls, port):
         with self._lock:
-            self.domain = (domain or "").strip()
-            self.labels = dict(labels) if isinstance(labels, dict) and labels \
-                else dict(DC_SUBDOMAINS)
+            self.domain = (domain or DEFAULT_DOMAIN).strip()
             self.use_tls = bool(use_tls)
             self.conn_hash = conn_hash if conn_hash is not None else DEFAULT_CONN_HASH
             self.user_agent = user_agent or PLUGIN_UA
             self.insecure_tls = bool(insecure_tls)
             self.port = int(port)
-            self.table, self.v6_prefix = build_routes(self.domain, self.labels)
+            self.table, self.v6_prefix = build_routes(self.domain)
 
     # ---- 生命周期 ----
     @property
@@ -656,15 +547,9 @@ class Relay(object):
         with self._lock:
             if self._server_sock is not None:
                 return True
-            if not self.domain:
-                self.last_error = "「域名」未填写"
-                self.log("未填写「域名」：没有可用的子域名，代理未启动"
-                         "（协议本身不需要内置域名，请填你自己的）")
-                return False
             if not self.table:
                 self.configure(self.domain, self.use_tls, self.conn_hash,
-                               self.user_agent, self.insecure_tls, self.port,
-                               self.labels)
+                               self.user_agent, self.insecure_tls, self.port)
             try:
                 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -680,9 +565,8 @@ class Relay(object):
             self._accept_thread = threading.Thread(
                 target=self._accept_loop, name="wsproxy-accept", daemon=True)
             self._accept_thread.start()
-            first = (self.labels or DC_SUBDOMAINS).get(1, "?")
-            self.log("tcp2ws listening on 127.0.0.1:%d -> *.%s (tls=%s, DC1 标签=%s)"
-                     % (self.port, self.domain, self.use_tls, first))
+            self.log("tcp2ws listening on 127.0.0.1:%d -> *.%s (tls=%s)"
+                     % (self.port, self.domain, self.use_tls))
             return True
 
     def stop(self):
@@ -974,13 +858,7 @@ class TelegramProxyBridge(object):
 # ---------------------------------------------------------------------------
 # 插件入口
 # ---------------------------------------------------------------------------
-# TG 代理列表那一行显示的名字（默认就是插件名）。留空则不改，仍显示 127.0.0.1:端口。
-PROXY_ROW_NAME = "WebSocket 代理"
-# 承载那一行的内部类；不同 fork 命名可能不同，依次尝试
-PROXY_CELL_CLASSES = [
-    "org.telegram.ui.ProxyListActivity$TextDetailProxyCell",
-    "org.telegram.ui.ProxyListActivity$ProxyCell",
-]
+PROVIDERS = ["Nullgram 默认", "自定义"]
 
 
 class WsProxyPlugin(BasePlugin):
@@ -989,23 +867,11 @@ class WsProxyPlugin(BasePlugin):
     def on_plugin_load(self):
         self._relay = Relay(self.log)
         self._bridge = TelegramProxyBridge(self.log) if _IN_HOST else None
-        self._row_unhook = None
         self._apply_config()
-        if _IN_HOST:
-            try:
-                self._install_proxy_row_hook()
-            except Exception as e:
-                self.log("安装代理列表改名 hook 失败（已忽略）: %s" % e)
         if self.get_setting("enabled", False):
             self._start()
 
     def on_plugin_unload(self):
-        try:
-            if getattr(self, "_row_unhook", None) is not None:
-                self._row_unhook()
-                self._row_unhook = None
-        except Exception:
-            pass
         self._stop()
 
     def on_app_event(self, event_type):
@@ -1019,132 +885,11 @@ class WsProxyPlugin(BasePlugin):
 
     # ---- 配置 ----
     def _effective_domain(self):
-        """「域名」里填的域名（必填）。"""
-        return (self.get_setting("domain", "") or "").strip()
-
-    def _label_salt(self):
-        """盐值：只使用设置里显式填写的值，绝不自动生成。
-
-        1.3.0 曾在这里生成随机盐并写回设置；一旦宿主设置没持久化（或用户重装插件），
-        标签每次启动都会变，DNS 立刻全部失配、表现就是"插件不能用"。
-        1.3.1 起留空 = 只按域名派生，永远稳定；需要换标签时再手动填盐值。
-        """
-        salt = (self.get_setting("label_salt", "") or "").strip()
-        self._salt_cache = salt
-        return salt
-
-    def _label_mode(self):
-        """当前生效的起名模式：0 自动生成 / 1 经典名 / 2 自定义。"""
-        try:
-            return int(self.get_setting("label_mode", 0) or 0)
-        except Exception:
-            return 0
-
-    def _labels(self):
-        return build_labels(
-            self._effective_domain(),
-            self._label_mode(),
-            self._label_salt(),
-            self.get_setting("label_custom", ""),
-        )
-
-    # ---- TG 代理列表改名（可选能力；宿主没有 hook API 时自动跳过）----
-    def _install_proxy_row_hook(self):
-        """把 TG 代理列表那一行的 127.0.0.1:端口 显示成名字。
-
-        TG 的 ProxyListActivity$TextDetailProxyCell.setProxy() 里写死了
-        textView.setText(address + ":" + port)，ProxyInfo 没有"名字"字段；
-        Nullgram 是靠改 app 源码给自家内置代理加特判。插件这边用宿主提供的
-        Xposed 式 hook，在 setProxy 之后覆写这个 TextView，效果一样且不动 app。
-        """
-        self._row_unhook = None
-        if not _HOOKS_OK:
-            self.log("代理列表改名：宿主未提供 hook API，已跳过（列表仍显示 127.0.0.1:端口）")
-            return False
-        for cname in PROXY_CELL_CLASSES:
-            try:
-                cls = hook_utils.find_class(cname)
-            except Exception:
-                cls = None
-            if cls is None:
-                continue
-            try:
-                methods = cls.getDeclaredMethods()
-            except Exception:
-                continue
-            for i in range(len(methods)):
-                try:
-                    m = methods[i]
-                    if m.getName() != "setProxy" or len(m.getParameterTypes()) != 1:
-                        continue
-                    m.setAccessible(True)
-                    try:
-                        hook = XposedHook(after=self._after_proxy_cell_set_proxy)
-                    except TypeError:
-                        hook = XposedHook(None, self._after_proxy_cell_set_proxy)
-                    unhook = self.hook_method(m, hook)
-                    if unhook is not None:
-                        self._row_unhook = unhook
-                        self.log("代理列表改名已启用：%s.setProxy -> %s"
-                                 % (cname, self.get_setting("proxy_row_name", PROXY_ROW_NAME)))
-                        return True
-                except Exception as e:
-                    self.log("hook setProxy 失败: %s" % e)
-        self.log("代理列表改名：没找到 ProxyCell.setProxy，已跳过（列表仍显示 127.0.0.1:端口）")
-        return False
-
-    def _after_proxy_cell_set_proxy(self, param):
-        """setProxy() 之后：若这一行是插件注册的本机代理，就把标题换成名字。"""
-        try:
-            name = (self.get_setting("proxy_row_name", PROXY_ROW_NAME) or "").strip()
-            if not name:
-                return
-            relay = getattr(self, "_relay", None)
-            if relay is None:
-                return
-            info = param.args[0]
-            try:
-                addr, port = info.address, info.port
-            except Exception:
-                addr = hook_utils.get_private_field(info, "address")
-                port = hook_utils.get_private_field(info, "port")
-            if str(addr) != "127.0.0.1" or port is None or int(port) != int(relay.port):
-                return
-            try:
-                view = hook_utils.get_private_field(param.thisObject, "textView")
-            except Exception:
-                view = None
-            if view is None:
-                view = getattr(param.thisObject, "textView", None)
-            if view is not None:
-                view.setText(name)
-        except Exception:
-            pass
-
-    def _dns_records_text(self):
-        """可直接导入 Cloudflare 的 zone 片段（BIND 格式，只保留最少注释）。
-
-        注意：这段文本会被整段粘进文件再上传，所以任何一行多余内容都可能
-        让人以为"导入失败"，这里刻意不写逐条说明（原理见 README）。
-        """
-        domain = self._effective_domain()
-        if not domain:
-            return ""
-        labels = self._labels()
-        lines = [
-            "; ws_proxy DNS records for %s" % domain,
-            "; Cloudflare Import: tick Proxy (orange cloud); SSL/TLS mode must be Flexible",
-        ]
-        for dc in LABEL_DOMAIN_DCS:
-            for ip in DC_RECORDS[dc][1]:
-                lines.append("%s.%s.\t1\tIN\tA\t%s" % (labels[dc], domain, ip))
-        for dc in LABEL_DOMAIN_DCS:
-            for ip in DC_RECORDS[dc][2]:
-                lines.append("%s.%s.\t1\tIN\tAAAA\t%s" % (labels[dc], domain, ip))
-        return "".join(line + "\n" for line in lines)
+        if int(self.get_setting("provider", 0)) == 0:
+            return DEFAULT_DOMAIN
+        return (self.get_setting("domain", "") or "").strip() or DEFAULT_DOMAIN
 
     def _apply_config(self):
-        self._salt_cache = None
         port_raw = self.get_setting("listen_port", str(DEFAULT_PORT))
         try:
             port = int(str(port_raw).strip())
@@ -1152,23 +897,14 @@ class WsProxyPlugin(BasePlugin):
                 port = DEFAULT_PORT
         except Exception:
             port = DEFAULT_PORT
-        domain = self._effective_domain()
-        labels = self._labels()
         self._relay.configure(
-            domain=domain,
+            domain=self._effective_domain(),
             use_tls=bool(self.get_setting("tls", True)),
             conn_hash=self.get_setting("conn_hash", DEFAULT_CONN_HASH),
             user_agent=self.get_setting("user_agent", PLUGIN_UA) or PLUGIN_UA,
             insecure_tls=bool(self.get_setting("insecure_tls", False)),
             port=port,
-            labels=labels,
         )
-        if domain:
-            self.log("子域名(DC1-5)：%s" % "  ".join(
-                "%s.%s" % (labels[dc], domain) for dc in (1, 2, 3, 4, 5)))
-            self.log("提示：设置页「复制 DNS 记录到剪贴板」可直接复制完整记录")
-        else:
-            self.log("「域名」尚未填写：代理不会启动，请先填你自己的域名")
 
     def _start(self):
         if not self._relay.running:
@@ -1207,113 +943,40 @@ class WsProxyPlugin(BasePlugin):
         def on_restart(*_a):
             self._restart()
 
-        def on_label_mode_change(*_a):
-            on_restart()
-            # 尽量让宿主重建这一页，好按所选「子域标签」显示对应输入框。
-            # 宿主若不支持 reload_settings，退出再进一次设置页同样生效。
-            try:
-                self.set_setting("label_mode", self.get_setting("label_mode", 0),
-                                 reload_settings=True)
-            except Exception:
-                pass
+        def status_subtext():
+            r = getattr(self, "_relay", None)
+            if r is None or not r.running:
+                return "未运行"
+            return "127.0.0.1:%d | 隧道 活动%d/累计%d | *.%s" % (
+                r.port, r.tunnels_open, r.tunnels_total, r.domain)
 
-        # 宿主在 loadPluginSettings() 里按 dataclass 反射构造这些设置项：只
-        # 要传了它不认识的参数就抛 TypeError，而异常会终结整页设置加载，
-        # 日志里表现为「Failed to load plugin settings」+
-        # 「Selector.__init__() got an unexpected keyword argument 'subtext'」
-        # （Selector 没有 subtext，Switch/Input/Text 才有）。这里统一兜底：
-        # 丢弃宿主不支持的参数，而不是把整页设置弄没。
-        def item(factory, **kw):
-            try:
-                return factory(**kw)
-            except TypeError:
-                try:
-                    import inspect
-                    allowed = inspect.signature(factory).parameters
-                    kw = dict((k, v) for k, v in kw.items() if k in allowed)
-                except Exception:
-                    kw.pop("subtext", None)
-                return factory(**kw)
-
-        mode = self._label_mode()
-        rows = [
-            item(Header, text="WebSocket 代理"),
-            item(Switch, key="enabled", text="启用代理", default=False,
-                   subtext="开启后本机 127.0.0.1 会监听端口，并把 Telegram 的流量转到你的域名",
+        return [
+            Header(text="WS Proxy (tcp2ws)"),
+            Switch(key="enabled", text="启用 WS 代理", default=False,
+                   subtext="启动本机 SOCKS5 中继并设为 Telegram 当前代理",
                    on_change=lambda *a: on_toggle_enabled()),
-            item(Input, key="domain", text="域名", default="",
-                  subtext="必填。只填域名本身：不要 http://，不要带子域名（例如 example.com）；"
-                          "建议用最外层域名，Cloudflare 的免费证书就能覆盖下面的子域名",
+            Selector(key="provider", text="服务商", default=0,
+                     items=PROVIDERS,
+                     on_change=lambda *a: on_restart()),
+            Input(key="domain", text="自定义域名", default="",
+                  subtext="仅「自定义」服务商生效，如 example.com",
                   on_change=lambda *a: on_restart()),
-            item(Selector, key="label_mode", text="子域标签", default=0,
-                     items=LABEL_MODES,
-                     on_change=lambda *a: on_label_mode_change()),
-        ]
-        if mode == 0:
-            rows.append(item(Input, key="label_salt", text="子域名随机串（留空即可）", default="",
-                              subtext="留空：按「域名」自动算出子域名，重启/重装都不变（推荐）。"
-                                      "填一串随机字符：换成另一套子域名（更难被猜），"
-                                      "但改它=换子域名，DNS 记录要跟着重配；"
-                                      "里面已有 16 位十六进制是旧版本自动生成的，清空同样会换子域名",
-                              on_change=lambda *a: on_restart()))
-        elif mode == 2:
-            rows.append(item(Input, key="label_custom", text="自定义子域名", default="",
-                              subtext="按 DC1,DC2,DC3,DC4,DC5 的顺序用英文逗号分隔；"
-                                      "示例：aa1（没写的会自动生成，只填 1 个也行）",
-                              on_change=lambda *a: on_restart()))
-        dns_text = self._dns_records_text()
-        if dns_text:
-            # 记录文本必须整段带走，所以这里不用 Input：Input 点开的是宿主的
-            # 「单行」输入框（PluginSettingsActivity.showStringInputDialog，
-            # TYPE_CLASS_TEXT 且没有 MULTI_LINE），换行在复制时会被 Android 的
-            # SingleLineTransformationMethod 换成空格 —— 粘到 Cloudflare 就只剩
-            # 一行，Import 必然失败。
-            # 因此改成两条：Text 一键写剪贴板（不走 TextView，换行原样保留），
-            # EditText(multiline) 供查看/手动选择（宿主 PluginEditTextCell 会
-            # setSingleLine(false)，换行同样保留）。
-            dns_key = "dns_copy_" + hashlib.sha1(dns_text.encode("utf-8")).hexdigest()[:8]
-            if Text is not None and copy_to_clipboard is not None:
-                rows.append(item(Text,
-                    text="复制 DNS 记录到剪贴板",
-                    subtext="点一下即可；已保留换行，可直接粘进 .txt 再上传",
-                    accent=True,
-                    on_click=lambda *a: copy_to_clipboard(dns_text)))
-            if EditText is not None:
-                rows.append(item(EditText,
-                    key=dns_key,
-                    hint="DNS 记录（可长按全选复制）",
-                    default=dns_text,
-                    multiline=True,
-                    max_length=8192))
-            else:
-                # 老宿主没有 EditText：退回原来的 Input，至少还能看到内容
-                rows.append(item(Input,
-                    key=dns_key,
-                    text="DNS 记录（点开复制）",
-                    default=dns_text,
-                    subtext="整段复制 → Cloudflare → DNS → Records → Import（勾选橙云）",
-                    on_change=lambda *a: None))
-        rows += [
-            item(Divider),
-            item(Header, text="高级（一般不用改）"),
-            item(Input, key="conn_hash", text="Conn-Hash", default=DEFAULT_CONN_HASH,
-                  subtext="只有自建 Pages/Workers 中继时才需要，要跟中继里的值一致",
+            Input(key="conn_hash", text="Conn-Hash", default=DEFAULT_CONN_HASH,
+                  subtext="中继握手附加头，自建服务端按部署文档填写",
                   on_change=lambda *a: on_restart()),
-            item(Input, key="proxy_row_name", text="代理列表里显示的名字", default=PROXY_ROW_NAME,
-                  subtext="TG 代理列表那一行写死了显示 127.0.0.1:端口；填这里会覆盖它"
-                          "（留空=不改，仍显示地址）",
+            Input(key="user_agent", text="User-Agent", default=PLUGIN_UA,
+                  subtext="Nullgram 公共中继要求 UA 含 Nullgram 字样",
                   on_change=lambda *a: on_restart()),
-            item(Input, key="user_agent", text="User-Agent", default=PLUGIN_UA,
-                  subtext="一般保持默认；万一上游返回 302/拒绝，可换成 Telegram Web 的 UA 再试",
-                  on_change=lambda *a: on_restart()),
-            item(Switch, key="tls", text="使用 TLS（wss）", default=True,
+            Switch(key="tls", text="使用 TLS (wss)", default=True,
                    subtext="Cloudflare 部署必须开启",
                    on_change=lambda *a: on_restart()),
-            item(Input, key="listen_port", text="本机端口", default=str(DEFAULT_PORT),
-                  subtext="插件在本机监听的 SOCKS5 端口，默认 6356",
+            Input(key="listen_port", text="监听端口", default=str(DEFAULT_PORT),
+                  subtext="本机 SOCKS5 端口，默认 6356",
                   on_change=lambda *a: on_restart()),
-            item(Switch, key="insecure_tls", text="跳过证书校验", default=False,
+            Switch(key="insecure_tls", text="跳过 TLS 证书校验", default=False,
                    subtext="仅排障使用，存在安全风险",
                    on_change=lambda *a: on_restart()),
+            Divider(),
+            Text(text="运行状态", subtext=status_subtext(),
+                 on_click=lambda *a: self.log(status_subtext())),
         ]
-        return rows

@@ -25,7 +25,7 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_PATH = os.path.join(HERE, "filter_enhancement.plugin")
 VERSIONS_DIR = os.path.join(HERE, "versions")
-ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4", "v1.0.5"]
+ALL_VERSIONS = ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4", "v1.0.5", "v1.0.6"]
 
 PASSED = [0]
 FAILED = [0]
@@ -104,7 +104,7 @@ def arg_kind(arg):
 
 
 def test_latest():
-    print("== 主版本（filter_enhancement.plugin，应为 v1.0.5）==")
+    print("== 主版本（filter_enhancement.plugin，应为 v1.0.6）==")
     src, tree = parse(PLUGIN_PATH)
 
     compile(src, PLUGIN_PATH, "exec")
@@ -115,7 +115,7 @@ def test_latest():
     check("__id__ 符合宿主格式",
           bool(re.match(r"^[a-zA-Z][a-zA-Z0-9_-]{1,31}$", meta.get("__id__", ""))))
     check("__name__ 非空", bool(meta.get("__name__")))
-    check("__version__ = 1.0.5", meta.get("__version__") == "1.0.5")
+    check("__version__ = 1.0.6", meta.get("__version__") == "1.0.6")
     check("__min_version__ >= 12.2.10",
           meta.get("__min_version__", "0") >= "12.2.10")
 
@@ -636,6 +636,43 @@ def test_v105_wiring():
     check("v1.0.5 含不可点击修复", "setClickable(False)" in src)
 
 
+def test_v106_no_dead_text_rows():
+    print("== v1.0.6 删除设置页里点不动的文本行（无效的文本按钮）==")
+    src, tree = parse(PLUGIN_PATH)
+
+    # 宿主 SDK 的 ui.settings.Text 只是个标签、不派发点击（同仓库的 ws-proxy
+    # v1.3.13 起也已彻底不用它）：它在设置页里看着像按钮，点下去什么都不会发生。
+    # 既然修不了，就按「不能修就直接删掉」删干净，并顺手去掉 Text 的导入。
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "ui.settings":
+            imported = {a.name for a in node.names}
+    check("不再导入 ui.settings.Text", "Text" not in imported)
+    check("仍导入 Header/Divider/Switch", {"Header", "Divider", "Switch"} <= imported)
+
+    text_calls = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "Text"]
+    check("设置页已无 Text 行", not text_calls)
+
+    tables = string_tables(tree)
+    dead = {"set_note", "set_note_about", "set_health", "set_health_ok",
+            "set_health_bad", "set_diag", "set_diag_text", "set_diag_yes",
+            "set_diag_no"}
+    check("已删除不再被引用的文案键", not (dead & tables.get("zh", set())))
+    check("中英键仍然一致", tables.get("zh", set()) == tables.get("en", set()))
+
+    # 信息不能凭空消失：打开设置页时把钩子状态与诊断计数写进插件日志
+    check("打开设置页时输出状态日志", "settings opened: hooks" in src)
+
+    # 版本演化：v1.0.5 仍带文本行（历史保真），v1.0.6 必须已删干净
+    v105 = os.path.join(VERSIONS_DIR, "v1.0.5", "filter_enhancement.plugin")
+    if os.path.isfile(v105):
+        src105, _ = parse(v105)
+        check("v1.0.5 仍含文本行（历史保真）", "Text(text=tr(\"set_note\")" in src105)
+    check("v1.0.6 已无 Text 行", "Text(text=tr(" not in src)
+
+
 def main():
     test_latest()
     test_all_versions()
@@ -644,6 +681,7 @@ def main():
     test_v104_wiring()
     test_v105_row_must_stay_non_clickable()
     test_v105_wiring()
+    test_v106_no_dead_text_rows()
     print("\n通过 %d 项，失败 %d 项。" % (PASSED[0], FAILED[0]))
     return 1 if FAILED[0] else 0
 
