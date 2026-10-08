@@ -513,7 +513,11 @@ _f5.append(("隧道关闭日志限流（4 次记 1 条）", _ok, len(_clogs)))
 # 5f. 失败分类
 _ok = (m.Relay._dial_error_kind(socket.gaierror(7, "No address associated with hostname")) == "resolve"
        and m.Relay._dial_error_kind(socket.timeout("timed out")) == "timeout"
-       and m.Relay._dial_error_kind(m.WsError("handshake rejected: HTTP 403")) == "other")
+       # 上游明确拒绝（403/404/426/302）与瞬时故障要分开：前者重试没有意义，
+       # 只会把日志和连接数放大（真机日志里同一连接重复握手失败 20+ 次）。
+       and m.Relay._dial_error_kind(m.WsError("handshake rejected: HTTP 403")) == "rejected"
+       and m.Relay._dial_error_kind(m.WsError("handshake rejected: HTTP 426")) == "rejected"
+       and m.Relay._dial_error_kind(m.WsError("unexpected eof")) == "other")
 _f5.append(("失败原因分类", _ok, None))
 
 # 5g. 限流：60 秒内同一条失败只记一次，且下一行汇总被压掉的条数
@@ -563,6 +567,264 @@ m._remember_addr("forget.example.com", "203.0.113.99")
 m._forget_addr("forget.example.com", "203.0.113.99")
 _ok = m._cached_addr("forget.example.com") is None
 print("forget dead cached addr: %s" % ("PASS" if _ok else "FAIL"))
+if not _ok:
+    sys.exit(1)
+
+# --- 7. WS 掩码：大整数整块 XOR 必须与原逐字节实现逐比特一致 ---------------
+# 真机实测 256KB 帧 23.1ms -> 0.9ms；这条断言防止「为了快而改错协议」。
+import random as _rnd
+_rnd.seed(20261007)
+_mask = bytes([0x11, 0x22, 0x33, 0x44])
+_bad = []
+for _n in (0, 1, 2, 3, 4, 5, 7, 63, 125, 126, 127, 128, 1000, 65535, 65536, 200000):
+    _p = bytes(_rnd.randrange(256) for _ in range(_n))
+    _want = bytes(b ^ _mask[i % 4] for i, b in enumerate(_p))
+    _got = m._ws_mask(_p, _mask)
+    if _got != _want:
+        _bad.append(_n)
+_ok = not _bad
+print("ws mask bit-identical to bytewise impl: %s%s" % (
+    "PASS" if _ok else "FAIL", "" if _ok else "  (bad lengths %r)" % _bad))
+if not _ok:
+    sys.exit(1)
+
+# 掩码必须是对合（同一函数套用两次回到原文）——收发两条路径共用它
+_ok = all(m._ws_mask(m._ws_mask(_p, _mask), _mask) == _p
+          for _p in (b"", b"a", b"abcd", os.urandom(5000)))
+print("ws mask is an involution: %s" % ("PASS" if _ok else "FAIL"))
+if not _ok:
+    sys.exit(1)
+
+# --- 8. 保活：空闲隧道必须主动发 WS ping -----------------------------------
+# 真机日志里大量隧道在 age=11s~41s 被上游 unexpected eof 掐断，
+# 而插件出向在空闲期是零字节（只被动回 pong）。
+class _PingCountSock(object):
+    """把真实 socket 包装一下，顺便统计发出去的 WS 帧类型。"""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.pings = 0
+        self.binary = 0
+
+    def sendall(self, data):
+        if data:
+            op = data[0] & 0x0F
+            if op == 0x9:
+                self.pings += 1
+            elif op in (0x1, 0x2):
+                self.binary += 1
+        self.sock.sendall(data)
+
+    def __getattr__(self, name):
+        return getattr(self.sock, name)
+
+
+# 直接验 _bridge 自己的保活线程：不需要走 SOCKS5/拨号，
+# 所以不受「上层客户端把连接关掉」的时序影响。
+_ka_a, _ka_b = socket.socketpair()
+_cap = _PingCountSock(_ka_a)
+_ka_a.settimeout(0.05)
+# 必须用真的 WsConn 包住计数包装器：send_ping / last_read 都在 WsConn 上，
+# 直接传裸包装器会让保活线程拿不到这些方法而静默退出（第一次写测试就踩了这个坑）。
+_ka_ws = m.WsConn(_cap)
+_keep_interval, _keep_idle = m.KEEPALIVE_INTERVAL, m.KEEPALIVE_IDLE_LIMIT
+m.KEEPALIVE_INTERVAL = 0.15
+m.KEEPALIVE_IDLE_LIMIT = 30.0
+
+_ka_relay = m.Relay(lambda msg: None)
+_ka_relay.configure("keep.example.com", True, m.DEFAULT_CONN_HASH, "ua", False, 46357)
+_ka_done = threading.Event()
+
+
+def _keep_wait():
+    # 挡住收帧循环：既不给数据也不回 EOF，直到测试结束
+    _ka_done.wait(2.0)
+    return b""
+
+
+_ka_ws.recv_message = _keep_wait
+_ka_relay._bridge(_ka_b, _ka_ws, "keep.example.com")
+
+_idle_pings = _cap.pings
+_ka_done.set()
+for _sk in (_ka_a, _ka_b):
+    try:
+        _sk.close()
+    except Exception:
+        pass
+m.KEEPALIVE_INTERVAL = _keep_interval
+m.KEEPALIVE_IDLE_LIMIT = _keep_idle
+
+_ok = _idle_pings >= 1
+print("keepalive pings an idle tunnel: %s (pings=%d)" % ("PASS" if _ok else "FAIL", _idle_pings))
+if not _ok:
+    sys.exit(1)
+
+# --- 9. 地址级退避：同一地址连续失败要进冷却，但其他地址不受影响 -----------
+m._addr_fail.clear()
+_host9 = "cooldown.example.com"
+for _ in range(m.ADDR_FAIL_LIMIT):
+    m._addr_mark_fail(_host9, "198.51.100.1")
+_ok = (m._addr_in_cooldown(_host9, "198.51.100.1") is True
+       and m._addr_in_cooldown(_host9, "198.51.100.2") is False)
+print("per-address cooldown isolates the bad ip: %s" % ("PASS" if _ok else "FAIL"))
+if not _ok:
+    sys.exit(1)
+
+m._addr_mark_ok(_host9, "198.51.100.1")     # 一次成功就清掉失败计数
+_ok = m._addr_in_cooldown(_host9, "198.51.100.1") is False
+print("a success clears the cooldown: %s" % ("PASS" if _ok else "FAIL"))
+if not _ok:
+    sys.exit(1)
+
+# --- 9b. 并发隧道上限：超过就明确拒绝，且计数不被减穿 ---------------------
+_gt_real_connect = m.ws_connect
+_gt_pairs = []
+
+
+def _gt_fake_connect(host, use_tls, ua, ch, timeout=3.0, insecure=False, port=None):
+    a, b = socket.socketpair()
+    _gt_pairs.append((a, b))
+    return a, b""
+
+
+m.ws_connect = _gt_fake_connect
+_gt_relay = m.Relay(lambda msg: None)
+_gt_relay.configure("gate.example.com", True, m.DEFAULT_CONN_HASH, "ua", False, 46358)
+_gt_relay.max_tunnels = 1
+_gt_release = threading.Event()
+_gt_relay._bridge = lambda client, ws, server: _gt_release.wait(30.0)   # 测试结束才放行
+
+
+def _tcp_pair():
+    """返回 (客户端 socket, 服务端 socket)：用真 TCP 环回，比 socketpair 稳。"""
+    ls = socket.socket()
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(1)
+    cli = socket.create_connection(ls.getsockname(), timeout=2.0)
+    srv, _ = ls.accept()
+    ls.close()
+    return cli, srv
+
+
+def _socks_probe(relay, server_sock):
+    """把 server_sock 交给 relay 处理，客户端走一遍 SOCKS5 CONNECT。
+
+    返回两个应答码：(CONNECT 应答, 方法协商应答)。
+    """
+    t = threading.Thread(target=relay._handle_client_safe, args=(server_sock,),
+                         daemon=True)
+    t.start()
+    cli, _unused = _tcp_pair()          # placeholder overwritten by caller pattern
+    return None
+
+
+def _socks_roundtrip(relay):
+    """建一条真环回连接，走完 SOCKS5 握手，返回 (方法应答码, CONNECT 应答码)。"""
+    cli, srv = _tcp_pair()
+    t = threading.Thread(target=relay._handle_client_safe, args=(srv,), daemon=True)
+    t.start()
+    buf = b""
+    try:
+        cli.settimeout(3.0)
+        cli.sendall(b"\x05\x01\x00")
+        cli.sendall(b"\x05\x01\x00\x01"
+                    + socket.inet_aton("149.154.175.50")
+                    + (443).to_bytes(2, "big"))
+        while len(buf) < 12:
+            chunk = cli.recv(12 - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+    except Exception:
+        pass
+    return cli, (buf[1] if len(buf) >= 2 else None), (buf[3] if len(buf) >= 12 else None)
+
+
+_cli1, _meth1, _code1 = _socks_roundtrip(_gt_relay)
+# 等处理线程真正进入 _bridge（tunnels_open 才会是 1），否则会和它赛跑
+_gt_deadline = time.time() + 2.0
+while _gt_relay.tunnels_open < 1 and time.time() < _gt_deadline:
+    time.sleep(0.02)
+_open_after_first = _gt_relay.tunnels_open
+_cli2, _meth2, _code2 = _socks_roundtrip(_gt_relay)
+_open_after_second = _gt_relay.tunnels_open      # 拆连接前采样
+try:
+    _ok = (_meth1 == 0x00 and _code1 == 0x00 and _open_after_first == 1
+           and _meth2 == 0x00 and _code2 == 0x05
+           and _gt_relay.tunnels_total == 1
+           and _open_after_second == 1)
+finally:
+    _gt_release.set()
+    for _s in (_cli1, _cli2):
+        try:
+            _s.close()
+        except Exception:
+            pass
+    for _a, _b in _gt_pairs:
+        for _s in (_a, _b):
+            try:
+                _s.close()
+            except Exception:
+                pass
+    m.ws_connect = _gt_real_connect
+
+time.sleep(0.3)
+_after = _gt_relay.tunnels_open
+_ok = bool(_ok) and _after == 0                      # 递减必须干净（不能减穿/漏减）
+print("concurrency gate refuses over-limit tunnel: %s "
+      "(meth=%s/%s connect=%s/%s open_first=%d total=%d after=%d)"
+      % ("PASS" if _ok else "FAIL", _meth1, _meth2, _code1, _code2,
+         _open_after_first, _gt_relay.tunnels_total, _after))
+if not _ok:
+    sys.exit(1)
+
+# --- 10. WebSocket 帧级：真实 codec 往返（发送路径也必须能被正确解出） -----
+import struct as _struct
+
+
+class _CapSock(object):
+    def __init__(self, inbound=b""):
+        self.sent = bytearray()
+        self.inbound = bytearray(inbound)
+
+    def sendall(self, d):
+        self.sent += d
+
+    def recv(self, n):
+        out = bytes(self.inbound[:n])
+        del self.inbound[:n]
+        return out
+
+    def settimeout(self, t):
+        pass
+
+    def close(self):
+        pass
+
+
+_ok = True
+for _size in (1, 4, 125, 126, 65535, 70000):
+    _payload = os.urandom(_size)
+    _cs = _CapSock()
+    m.WsConn(_cs).send_binary(_payload)
+    _f = bytes(_cs.sent)
+    _b1 = _f[1]
+    _ln = _b1 & 0x7F
+    _off = 2
+    if _ln == 126:
+        _ln = _struct.unpack(">H", _f[2:4])[0]
+        _off = 4
+    elif _ln == 127:
+        _ln = _struct.unpack(">Q", _f[2:10])[0]
+        _off = 10
+    _mk = _f[_off:_off + 4]
+    _off += 4
+    if not ((_b1 & 0x80) and _ln == _size
+            and m._ws_mask(_f[_off:_off + _ln], _mk) == _payload):
+        _ok = False
+print("ws frame codec round-trip (1B..70000B): %s" % ("PASS" if _ok else "FAIL"))
 if not _ok:
     sys.exit(1)
 

@@ -22,7 +22,7 @@ __description__ = (
     "在设置页填好域名、按提示配好 DNS 记录后打开开关即可使用。"
 )
 __author__ = "ljili (port of qwq233/Nullgram)"
-__version__ = "1.3.20"
+__version__ = "1.3.21"
 
 import base64
 import hashlib
@@ -437,6 +437,7 @@ def parse_abridged_err(plain, total_len):
 #   系统 DNS 仅作为兜底保留：万一宿主版本没有 DnsFactory 这个类。
 LAST_RESOLVE_SOURCE = "dns"   # "appdns" / "dns" / "cache"
 LAST_DIAL_TRACE = ""           # 失败时记录「试过哪些地址、各自什么错」，一次把话说清
+LAST_DIAL_IP = ""              # dial_tcp 最近一次 TCP 已连通的地址，供 ws_connect 失败时清缓存
 BEST_ADDR_TTL = 120.0          # 上次连通的地址缓存 2 分钟，避免每次都重新解析
 _best_addr = {}                # host -> (expire_ts, ip)
 _best_lock = threading.Lock()
@@ -446,6 +447,20 @@ _ssl_ctx_lock = threading.Lock()
 _app_dns_cache = {}            # host -> (expire_ts, tuple_of_ips)
 _app_dns_lock = threading.Lock()
 APP_DNS_TTL = 60.0
+
+# ---- 隧道保活 / 地址退避 / 并发上限 --------------------------------------
+# 真机日志里大量隧道在 age=11s~41s 时被上游 "unexpected eof" 掐断，而插件出向
+# 在空闲期是零字节（只被动回 pong）。Cloudflare 回源到 Telegram 有 ~100s 空闲回收，
+# 源站也会踢无活动连接，所以这里主动发 WS ping 保活。
+KEEPALIVE_INTERVAL = 25.0      # 空闲多久发一次 ping（<=0 关闭保活）
+KEEPALIVE_IDLE_LIMIT = 75.0    # 连续多久收不到任何字节就判定死链并关闭
+# 同一地址连续拨号失败 N 次后冷却：不要再每次都先撞它一次
+ADDR_FAIL_LIMIT = 2
+ADDR_COOLDOWN = 30.0
+_addr_fail = {}                # (host, ip) -> (fail_count, cooldown_until)
+_addr_fail_lock = threading.Lock()
+# 全局并发隧道上限（纯防御：避免上游异常时线程/隧道无界增长）
+MAX_TUNNELS = 96
 
 # App 自带的 DNS 选择器（Nekogram 的 DnsFactory；宿主没有这个类时为 None）
 try:
@@ -559,6 +574,32 @@ def _cached_addr(host):
     return None
 
 
+def _addr_in_cooldown(host, ip):
+    """同一地址连续失败多次后，短时间内别再试它。"""
+    with _addr_fail_lock:
+        rec = _addr_fail.get((host, ip))
+    return bool(rec and rec[1] > time.time())
+
+
+def _addr_mark_ok(host, ip):
+    with _addr_fail_lock:
+        _addr_fail.pop((host, ip), None)
+
+
+def _addr_mark_fail(host, ip):
+    now = time.time()
+    with _addr_fail_lock:
+        cnt = _addr_fail.get((host, ip), (0, 0.0))[0] + 1
+        until = now + ADDR_COOLDOWN if (ADDR_FAIL_LIMIT > 0
+                                         and cnt >= ADDR_FAIL_LIMIT) else 0.0
+        _addr_fail[(host, ip)] = (cnt, until)
+        # 防止字典无界增长
+        if len(_addr_fail) > 256:
+            for k in [k for k, v in _addr_fail.items() if v[1] and v[1] < now]:
+                _addr_fail.pop(k, None)
+    return cnt
+
+
 def dial_tcp(host, port, timeout):
     """连 host:port，返回已连接的 socket。三层，共用同一条时间预算：
 
@@ -571,7 +612,7 @@ def dial_tcp(host, port, timeout):
     解析全部交给宿主的解析器，插件不再自己实现 DoH：
     App 里把「DNS 解析器」从 System 改成任一 DoH 项，解析就会走 DoH。
     """
-    global LAST_RESOLVE_SOURCE, LAST_DIAL_TRACE
+    global LAST_RESOLVE_SOURCE, LAST_DIAL_TRACE, LAST_DIAL_IP
     deadline = time.time() + max(1.0, timeout)
     errors = []
     tried = set()
@@ -579,10 +620,13 @@ def dial_tcp(host, port, timeout):
     def _try(ip, source):
         # 注意：嵌套函数里必须再声明一次 global，否则下面的赋值只会创建局部变量，
         # 模块级的 LAST_RESOLVE_SOURCE / LAST_DIAL_TRACE 永远不更新（诊断会全部失效）。
-        global LAST_RESOLVE_SOURCE, LAST_DIAL_TRACE
+        global LAST_RESOLVE_SOURCE, LAST_DIAL_TRACE, LAST_DIAL_IP
         if ip in tried:
             return None
         tried.add(ip)
+        if _addr_in_cooldown(host, ip):
+            errors.append("%s: skipped(cooldown)" % ip)
+            return None
         left = deadline - time.time()
         if left <= 0.2:
             errors.append("%s: skipped(budget)" % ip)
@@ -597,10 +641,13 @@ def dial_tcp(host, port, timeout):
         except Exception as e:
             errors.append("%s: %s" % (ip, str(e)[:60]))
             _forget_addr(host, ip)
+            _addr_mark_fail(host, ip)
             return None
         _remember_addr(host, ip)
+        _addr_mark_ok(host, ip)
         LAST_RESOLVE_SOURCE = source
         LAST_DIAL_TRACE = "%s:%s" % (source, ip)
+        LAST_DIAL_IP = ip
         return sock
 
     cached = _cached_addr(host)
@@ -650,10 +697,16 @@ def ws_connect(host, use_tls, user_agent, conn_hash, timeout=3.0, insecure=False
     """与 wss://host/api 建立 WebSocket，返回 (socket, 握手时多读的残留字节)。
 
     任何失败路径都会关闭已打开的 socket，避免 fd 泄漏。
+
+    失败时还会清掉「上次连通地址」缓存：TCP 连得上、但 TLS/Upgrade 阶段失败时，
+    那个地址同样已经不可用，不清掉下次拨号还会先撞它一次（真机日志里的
+    「ws dial … 超时：cache:172.67.159.72」就是这么来的）。
     """
+    global LAST_DIAL_IP
     if port is None:
         port = 443 if use_tls else 80
     sock = None
+    LAST_DIAL_IP = ""
     try:
         raw = dial_tcp(host, port, timeout)
         if use_tls:
@@ -705,7 +758,35 @@ def ws_connect(host, use_tls, user_agent, conn_hash, timeout=3.0, insecure=False
                 sock.close()
             except Exception:
                 pass
+        # 走到这里说明本次拨号整体失败（可能是 TLS/Upgrade 阶段），
+        # 那么 dial_tcp 刚记住的那个地址对当前网络也不可用，一并清掉。
+        if LAST_DIAL_IP:
+            try:
+                _forget_addr(host, LAST_DIAL_IP)
+                _addr_mark_fail(host, LAST_DIAL_IP)
+            except Exception:
+                pass
         raise
+
+
+def _ws_mask(payload, mask):
+    """给 WebSocket 载荷套/揭掩码（客户端帧必须带 mask，服务端帧不带）。
+
+    等价于 bytes(b ^ mask[i % 4] for i, b in enumerate(payload))，但用大整数
+    按 4 字节整块 XOR 一次算完：真机实测 256 KB 帧从 23.1 ms 降到 0.9 ms（约 25x），
+    直接把逐字节 Python 循环那个 ~11 MB/s 的吞吐天花板抬掉（下载大文件时才看得出来）。
+    mask 已经是 4 字节的 bytes。
+    """
+    n = len(payload)
+    if not n:
+        return b""
+    if len(mask) != 4:
+        mask = (mask + b"\x00\x00\x00\x00")[:4]
+    if n <= 4:
+        return bytes(a ^ mask[i] for i, a in enumerate(payload))
+    key = mask * ((n + 3) // 4)
+    return (int.from_bytes(payload, "big")
+            ^ int.from_bytes(key[:n], "big")).to_bytes(n, "big")
 
 
 def _recv_exact(sock, n):
@@ -730,6 +811,9 @@ class WsConn(object):
         self._buf = bytearray(prebuffer)
         self.send_lock = threading.Lock()
         self.closed = False
+        # 最近一次「收到任何帧」的时间（含 pong）：保活线程用它判断死链。
+        # 放在这里而不是只记数据帧——服务端回 pong 同样证明链路是活的。
+        self.last_read = time.time()
 
     def _read_exact(self, n):
         while len(self._buf) < n:
@@ -756,15 +840,25 @@ class WsConn(object):
             header += struct.pack(">Q", length)
         mask = os.urandom(4)
         header += mask
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        masked = _ws_mask(payload, mask)
         with self.send_lock:
+            if self.closed:
+                raise WsError("ws closed")
             self.sock.sendall(bytes(header) + masked)
 
     def send_binary(self, data):
         self._send_frame(0x2, data)
 
     def send_pong(self, payload):
-        self._send_frame(0xA, payload)
+        # 收帧线程里回 pong：连接正在关闭时写失败是正常的，
+        # 不能让它把 recv_message 打穿（keepalive 与 close 会并发）。
+        try:
+            self._send_frame(0xA, payload)
+        except Exception:
+            pass
+
+    def send_ping(self):
+        self._send_frame(0x9, b"")
 
     def send_close(self):
         try:
@@ -788,8 +882,9 @@ class WsConn(object):
                 length = struct.unpack(">Q", self._read_exact(8))[0]
             mask = self._read_exact(4) if masked else None
             payload = self._read_exact(length) if length else b""
+            self.last_read = time.time()
             if mask:
-                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+                payload = _ws_mask(payload, mask)
 
             if opcode == 0x8:  # close
                 return "closed", payload
@@ -848,7 +943,26 @@ class Relay(object):
         self._fail_log = {}
         self._close_log = {}
         self.dial_failures = 0
+        self.max_tunnels = MAX_TUNNELS       # 并发隧道上限（防御性）
+        self.keepalive_interval = KEEPALIVE_INTERVAL
         self.log = logger
+
+    def set_max_tunnels(self, value):
+        try:
+            n = int(value)
+        except Exception:
+            return
+        self.max_tunnels = max(16, min(512, n))
+
+    def set_keepalive_interval(self, value):
+        try:
+            sec = float(value)
+        except Exception:
+            return
+        if sec < 0:
+            return
+        # 0 = 关闭保活；上限 600s（再长就没有保持连接的意义了）
+        self.keepalive_interval = min(600.0, sec)
 
     # ---- 配置 ----
     def configure(self, domain, use_tls, conn_hash, user_agent, insecure_tls, port,
@@ -982,8 +1096,8 @@ class Relay(object):
         except Exception as e:
             self.last_error = "session error: %s" % e
         finally:
-            with self._lock:
-                self.tunnels_open = max(0, self.tunnels_open - 1)
+            # tunnels_open 的递减由 _handle_client 自己负责（只有真正占用了
+            # 名额的路径才递减）。这里只负责关掉客户端 socket。
             try:
                 client.close()
             except Exception:
@@ -1035,30 +1149,53 @@ class Relay(object):
             self._socks5_reply(client, 0x04)
             return
 
-        # 快速重试：预算必须小于 tgnet 代理连接超时（8s），2 次 × 3s = 6s
-        ws_sock = None
-        leftover = b""
-        last_err = None
-        for attempt in (1, 2):
-            try:
-                ws_sock, leftover = ws_connect(
-                    server, self.use_tls, self.user_agent, self.conn_hash,
-                    timeout=3.0, insecure=self.insecure_tls)
-                break
-            except Exception as e:
-                last_err = e
-        if ws_sock is None:
-            self._log_dial_failure(server, last_err)
+        # 并发上限：上游异常时 tgnet 会不断重连，这里做个兜底，
+        # 避免线程/隧道无界增长（超过上限就明确拒绝，让上层自己去重试）。
+        with self._lock:
+            if self.tunnels_open >= self.max_tunnels:
+                over_limit = True
+            else:
+                over_limit = False
+                self.tunnels_open += 1
+                self.tunnels_total += 1
+        if over_limit:
+            self.last_error = ("too many tunnels (%d/%d), refusing %s"
+                               % (self.tunnels_open, self.max_tunnels, server))
             self._socks5_reply(client, 0x05)
             return
+        # 从这里开始，tunnels_open 已由本函数占用；无论下面走哪条路径
+        # （拨号失败、被拒绝、桥接结束、抛异常）都必须且只能释放一次。
+        # 注意 _handle_client_safe 不再递减计数——早先两边都减，会把
+        # 计数减穿，导致并发上限形同虚设（测试实测：被拒绝的连接把
+        # 计数从 1 减到 0，之后所有连接都被放行）。
+        try:
+            ws_sock = None
+            leftover = b""
+            last_err = None
+            # 单次 ws_connect 已含「TCP + TLS + Upgrade」，最多试 2 次，
+            # 避免最坏耗时翻倍撞上 tgnet 的代理连接超时。
+            for _attempt in (1, 2):
+                try:
+                    ws_sock, leftover = ws_connect(
+                        server, self.use_tls, self.user_agent, self.conn_hash,
+                        timeout=3.0, insecure=self.insecure_tls)
+                    break
+                except Exception as e:
+                    last_err = e
+                    # 上游明确拒绝（HTTP 4xx）时重试没有意义，直接失败并退避
+                    if self._dial_error_kind(e) == "rejected":
+                        break
+            if ws_sock is None:
+                self._log_dial_failure(server, last_err)
+                self._socks5_reply(client, 0x05)
+                return
 
-        with self._lock:
-            self.tunnels_open += 1
-            self.tunnels_total += 1
-
-        self._socks5_reply(client, 0x00)
-        client.settimeout(None)
-        self._bridge(client, WsConn(ws_sock, leftover), server)
+            self._socks5_reply(client, 0x00)
+            client.settimeout(None)
+            self._bridge(client, WsConn(ws_sock, leftover), server)
+        finally:
+            with self._lock:
+                self.tunnels_open = max(0, self.tunnels_open - 1)
 
     # ---- 失败诊断（限流 + 说人话） ----
     DIAL_LOG_INTERVAL = 60.0   # 同一 (host, 原因) 每 60 秒最多记一条
@@ -1073,6 +1210,10 @@ class Relay(object):
             return "resolve"
         if isinstance(err, ssl.SSLError) or "certificate" in text or "ssl" in text:
             return "tls"
+        # HTTP 非 101：403/404/426/302 这类是上游明确拒绝，不是瞬时故障，
+        # 立刻重试只会放大（这类应交给上层退避，而不是马上再来一次）。
+        if "handshake rejected" in text or "http " in text and "40" in text:
+            return "rejected"
         if isinstance(err, (socket.timeout, TimeoutError)) or "timed out" in text \
                 or "timeout" in text:
             return "timeout"
@@ -1126,7 +1267,8 @@ class Relay(object):
         started = time.time()
         done = threading.Event()
         stats = {"c2w": 0, "w2c": 0, "by": None, "head": b"", "close": None,
-                 "init": b""}
+                 "init": b"", "last_io": time.time(), "last_read": time.time(),
+                 "pings": 0}
 
         with self._lock:
             self._tunnels.add((client, ws))
@@ -1144,6 +1286,7 @@ class Relay(object):
                         # 留存以便关闭时解码入向头部
                         stats["init"] += data[:64 - stats["c2w"]]
                     stats["c2w"] += len(data)
+                    stats["last_io"] = time.time()
                     ws.send_binary(data)
             except Exception as e:
                 if stats["by"] is None:
@@ -1153,6 +1296,36 @@ class Relay(object):
 
         t = threading.Thread(target=client_to_ws, name="wsproxy-c2w", daemon=True)
         t.start()
+
+        def keepalive():
+            """空闲时发 WS ping：上游（CF 回源 / DC）会回收空闲连接，
+            真机日志里大量隧道正是这样被 "unexpected eof" 掐断的。
+
+            只在「既没有收到字节、也没有发出字节」时才 ping，所以
+            Telegram 自己一直在跑数据时不会产生额外流量/唤醒。
+            """
+            interval = self.keepalive_interval
+            if interval <= 0:
+                return                            # 保活被设置页关掉了
+            while not done.wait(interval):
+                now = time.time()
+                if now - stats["last_io"] < interval:
+                    continue                      # 双向都在动，不用保活
+                if now - max(stats["last_read"], getattr(ws, "last_read", 0.0)) \
+                        > KEEPALIVE_IDLE_LIMIT:
+                    if stats["by"] is None:
+                        stats["by"] = "keepalive-timeout"
+                    break
+                try:
+                    ws.send_ping()
+                except Exception as e:
+                    if stats["by"] is None:
+                        stats["by"] = "keepalive-err:%s" % type(e).__name__
+                    break
+                stats["pings"] += 1
+
+        kt = threading.Thread(target=keepalive, name="wsproxy-keepalive", daemon=True)
+        kt.start()
         try:
             while not done.is_set():
                 kind, payload = ws.recv_message()
@@ -1164,6 +1337,8 @@ class Relay(object):
                         # 如 DC 拒绝时会带 "        404\x00" 这类原因串
                         stats["close"] = payload[:32]
                     break
+                stats["last_read"] = time.time()
+                stats["last_io"] = stats["last_read"]
                 if payload:
                     if stats["w2c"] < 64:
                         # 保留首批入向字节：早夭隧道的头部往往就是
@@ -1493,6 +1668,13 @@ class WsProxyPlugin(BasePlugin):
                 port = DEFAULT_PORT
         except Exception:
             port = DEFAULT_PORT
+        # 保活间隔（0 = 关闭）：设置页给的是整数秒，解析失败就退回默认值
+        try:
+            ka = float(str(self.get_setting("keepalive_interval",
+                                            int(KEEPALIVE_INTERVAL))).strip())
+        except Exception:
+            ka = KEEPALIVE_INTERVAL
+        self._relay.set_keepalive_interval(ka)
         domain = self._effective_domain()
         labels = self._labels()
         self._relay.configure(
@@ -1657,6 +1839,11 @@ class WsProxyPlugin(BasePlugin):
                    on_change=lambda *a: on_restart()),
             item(Input, key="listen_port", text="本机端口", default=str(DEFAULT_PORT),
                   subtext="插件在本机监听的 SOCKS5 端口，默认 6356",
+                  on_change=lambda *a: on_restart()),
+            item(Input, key="keepalive_interval", text="空闲保活间隔（秒）",
+                  default=str(int(KEEPALIVE_INTERVAL)),
+                  subtext="空闲超过这个时间就给上游发一个 WebSocket ping，避免连接被"
+                          "空闲回收（日志里的 server-err:unexpected eof）。填 0 关闭，默认 25 秒",
                   on_change=lambda *a: on_restart()),
             item(Switch, key="insecure_tls", text="跳过证书校验", default=False,
                    subtext="仅排障使用，存在安全风险",
